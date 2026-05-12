@@ -17,7 +17,73 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useCallback, useRef, useEffect } = React;
+const { useState, useCallback, useRef, useEffect, useContext } = React;
+
+const THEMES = {
+  cream: { appBg:"#efe9dc", paper:"#f9f6f0", card:"#fff", ink:"#2a2620", soft:"#6a6055", faint:"#a09888", hair:"#e8e2d8", warm:"#b85c3c", calm:"#5a7a5a", gold:"#c9a961" },
+  sand:  { appBg:"#e7dcc8", paper:"#f7f0e4", card:"#fffaf2", ink:"#2d261c", soft:"#6e6050", faint:"#a08e78", hair:"#ddd0bb", warm:"#b86542", calm:"#647f5c", gold:"#c6a24d" },
+  slate: { appBg:"#20242a", paper:"#2b3037", card:"#343a43", ink:"#f4efe6", soft:"#b0a498", faint:"#7a7068", hair:"#404850", warm:"#d0795a", calm:"#8eaa83", gold:"#d8bc6a" },
+};
+const ThemeContext = React.createContext(THEMES.cream);
+window.THEMES = THEMES;
+window.ThemeContext = ThemeContext;
+
+const NIGHT_START = 1;
+const NIGHT_END = 5;
+const NIGHT_LABEL = "01:00–05:59";
+const MAX_GAP_MIN = 15;
+const RAW_PERSIST_LIMIT = 5 * 1024 * 1024;
+const STORAGE_KEYS = {
+  analysis: "hrc-analysis",
+  raw: "hrc-raw",
+  month: "hrc-selected-month",
+  view: "hrc-current-view",
+  theme: "hrc-theme",
+  accentWarm: "hrc-accent-warm",
+  age: "hrc-age",
+  fileName: "hrc-file-name",
+};
+window.NIGHT_START = NIGHT_START;
+window.NIGHT_END = NIGHT_END;
+
+function safeJsonParse(value, fallback = null) {
+  if (!value) return fallback;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function readStorage(key, fallback = null) {
+  try {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : value;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStorage(key, value) {
+  try {
+    if (value === null || value === undefined || value === "") localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {}
+}
+
+function removeStorageKeys(keys) {
+  try { keys.forEach(key => localStorage.removeItem(key)); } catch {}
+}
+
+function getSepLabel(sep) {
+  return sep === "\t" ? "tab" : sep === "," ? "comma" : "semicolon";
+}
+
+function confidence(nightCoverage) {
+  if (nightCoverage >= 70) return "high";
+  if (nightCoverage >= 40) return "medium";
+  return "low";
+}
+
+function confidenceLabel(level) {
+  return level === "high" ? "high confidence" : level === "medium" ? "limited night data" : "very limited night data";
+}
 
 // ─── Data Processing Engine ─────────────────────────────────────────────────
 
@@ -116,10 +182,13 @@ function previewZeppData(raw) {
   const medianInterval = deltas.length ? Math.round(medianArr(deltas) * 10) / 10 : null;
 
   const days = groupByDate(readings);
-  const coverMinutes = Object.values(days).map(rs => sumCoveredMinutes(rs));
-  const avgCoverage = coverMinutes.length ? Math.round((meanArr(coverMinutes) / 1440) * 100) : 0;
-  const minCoverage = coverMinutes.length ? Math.round((Math.min(...coverMinutes) / 1440) * 100) : 0;
-  const maxCoverage = coverMinutes.length ? Math.round((Math.max(...coverMinutes) / 1440) * 100) : 0;
+  const coverageSummaries = Object.values(days).map(rs => computeCoverage(rs));
+  const avgCoverage = coverageSummaries.length ? Math.round(meanArr(coverageSummaries.map(c => c.coverageTotal))) : 0;
+  const minCoverage = coverageSummaries.length ? Math.round(Math.min(...coverageSummaries.map(c => c.coverageTotal))) : 0;
+  const maxCoverage = coverageSummaries.length ? Math.round(Math.max(...coverageSummaries.map(c => c.coverageTotal))) : 0;
+  const sampledDays = Object.values(groupByDate(readings.slice(0, 500)));
+  const sampledCoverage = sampledDays.map(rs => computeCoverage(rs));
+  const avgNightCoverage = sampledCoverage.length ? Math.round(meanArr(sampledCoverage.map(c => c.coverageNight))) : 0;
 
   return {
     ok: readings.length >= 20,
@@ -136,6 +205,7 @@ function previewZeppData(raw) {
     avgCoverage,
     minCoverage,
     maxCoverage,
+    avgNightCoverage,
   };
 }
 
@@ -167,10 +237,15 @@ function computeDataQuality(days) {
   const report = { totalDays: dateKeys.length, validDays: 0, incompleteDays: 0, coverageByDay: {} };
   for (const dk of dateKeys) {
     const count = days[dk].length;
-    const coveredMinutes = sumCoveredMinutes(days[dk]);
-    const coverage = Math.min(100, Math.round((coveredMinutes / 1440) * 100));
-    report.coverageByDay[dk] = { count, coveredMinutes, coverage };
-    if (coverage >= 80) report.validDays++;
+    const coverageStats = computeCoverage(days[dk]);
+    report.coverageByDay[dk] = {
+      count,
+      coveredMinutes: coverageStats.totalMinutes,
+      coverage: coverageStats.coverageTotal,
+      nightCoverage: coverageStats.coverageNight,
+      dayCoverage: coverageStats.coverageDay,
+    };
+    if (coverageStats.coverageTotal >= 80) report.validDays++;
     else report.incompleteDays++;
   }
   const coverages = Object.values(report.coverageByDay).map(c => c.coverage);
@@ -185,14 +260,18 @@ function computeBaseline(days) {
   const dateKeys = Object.keys(days).sort();
   const firstTwoWeeks = dateKeys.slice(0, 14);
   for (const dk of firstTwoWeeks) {
+    const coverageStats = computeCoverage(days[dk]);
+    if (coverageStats.coverageNight < 50) continue;
     for (const r of days[dk]) {
-      if (r.hour >= 1 && r.hour <= 5) allNightReadings.push(r.bpm);
+      if (r.hour >= NIGHT_START && r.hour <= NIGHT_END) allNightReadings.push(r.bpm);
     }
   }
   if (allNightReadings.length < 10) {
     for (const dk of dateKeys) {
+      const coverageStats = computeCoverage(days[dk]);
+      if (coverageStats.coverageNight < 50) continue;
       for (const r of days[dk]) {
-        if (r.hour >= 1 && r.hour <= 5) allNightReadings.push(r.bpm);
+        if (r.hour >= NIGHT_START && r.hour <= NIGHT_END) allNightReadings.push(r.bpm);
       }
     }
   }
@@ -214,32 +293,156 @@ function meanArr(arr) {
   return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
 }
 
+function weightedMean(arr, weightFn = () => 1) {
+  if (!arr || arr.length === 0) return 0;
+  let total = 0;
+  let totalWeight = 0;
+  for (const item of arr) {
+    const weight = Math.max(0, weightFn(item) || 0);
+    if (weight <= 0) continue;
+    total += item * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? total / totalWeight : 0;
+}
+
+function getConfidenceWeight(day) {
+  if (!day) return 0;
+  if (day.confidence === "high") return 1;
+  if (day.confidence === "medium") return 0.65;
+  return 0.25;
+}
+
+function getCoverageWeight(day) {
+  const base = getConfidenceWeight(day);
+  const nightCoverage = day?.coverageNight ?? day?.rawMetrics?.coverageNight ?? 0;
+  return base * Math.max(0.1, nightCoverage / 100);
+}
+
+function summarizeConfidence(days) {
+  const valid = (days || []).filter(d => !d.incomplete);
+  if (valid.length === 0) {
+    return { label: "Insufficient", sufficientNightPct: 0, lowConfidenceDays: 0, weightedCoverageNight: 0 };
+  }
+  const sufficientNightPct = Math.round((valid.filter(d => (d.coverageNight ?? 0) >= 50).length / valid.length) * 100);
+  const weightedCoverageNight = Math.round(weightedMean(valid.map(d => d.coverageNight ?? 0), (_, i) => getCoverageWeight(valid[i])));
+  const lowConfidenceDays = valid.filter(d => d.confidence === "low").length;
+  const label = sufficientNightPct >= 80 ? "Good" : sufficientNightPct >= 60 ? "Fair" : "Weak";
+  return { label, sufficientNightPct, lowConfidenceDays, weightedCoverageNight };
+}
+
+function summarizeRange(days, baseline) {
+  const valid = (days || []).filter(d => !d.incomplete);
+  if (valid.length === 0) {
+    return {
+      avgRecovery: 0,
+      avgStress: 0,
+      avgLoad: 0,
+      avgEfficiency: 0,
+      avgDebt: 0,
+      monthRestingHR: null,
+      dataQuality: summarizeConfidence(valid),
+    };
+  }
+  const weightFor = day => getCoverageWeight(day);
+  const avgRecovery = weightedMean(valid.map(d => d.recoveryQuality), (_, i) => weightFor(valid[i]));
+  const avgStress = weightedMean(valid.map(d => d.stressSignature), (_, i) => weightFor(valid[i]));
+  const avgLoad = weightedMean(valid.map(d => d.autonomicLoad), (_, i) => weightFor(valid[i]));
+  const avgEfficiency = weightedMean(valid.map(d => d.cardioEfficiency), (_, i) => weightFor(valid[i]));
+  const avgDebt = weightedMean(valid.map(d => d.recoveryDebt), (_, i) => weightFor(valid[i]));
+  const nightDays = valid.filter(d => d.nightMeanHR !== null);
+  const monthRestingHR = nightDays.length
+    ? Math.round(weightedMean(nightDays.map(d => d.nightMeanHR), (_, i) => weightFor(nightDays[i])))
+    : baseline?.restingHR ?? null;
+  return {
+    avgRecovery,
+    avgStress,
+    avgLoad,
+    avgEfficiency,
+    avgDebt,
+    monthRestingHR,
+    dataQuality: summarizeConfidence(valid),
+  };
+}
+
+function rollingMean(days, index, key, windowSize, predicate = d => !d.incomplete && d[key] !== null && d[key] !== undefined) {
+  const start = Math.max(0, index - windowSize + 1);
+  const window = [];
+  for (let i = start; i <= index; i++) {
+    if (predicate(days[i])) window.push(days[i][key]);
+  }
+  return window.length ? Math.round(meanArr(window) * 10) / 10 : null;
+}
+
+function rollingWeightedMean(days, index, key, windowSize) {
+  const start = Math.max(0, index - windowSize + 1);
+  const window = [];
+  const weights = [];
+  for (let i = start; i <= index; i++) {
+    const day = days[i];
+    if (day.incomplete || day[key] === null || day[key] === undefined) continue;
+    window.push(day[key]);
+    weights.push(getCoverageWeight(day));
+  }
+  if (window.length === 0) return null;
+  let total = 0;
+  let totalWeight = 0;
+  for (let i = 0; i < window.length; i++) {
+    total += window[i] * weights[i];
+    totalWeight += weights[i];
+  }
+  return totalWeight > 0 ? Math.round((total / totalWeight) * 10) / 10 : null;
+}
+
 function medianArr(arr) {
   if (!arr || arr.length === 0) return 0;
   const a = [...arr].sort((x, y) => x - y);
   const mid = Math.floor(a.length / 2);
   return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
 }
-function clampSampleMinutes(minutes, fallback = 1, maxMinutes = 10) {
+function clampSampleMinutes(minutes, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   if (!Number.isFinite(minutes) || minutes <= 0) return fallback;
   return Math.max(0.5, Math.min(maxMinutes, minutes));
 }
-function getSampleMinutes(readings, index, fallback = 1, maxMinutes = 10) {
+function getSampleMinutes(readings, index, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   const current = readings[index];
   const next = readings[index + 1];
   if (!current || !next) return fallback;
   const delta = (next.dt - current.dt) / 60000;
   const sameDay = current.dateKey === next.dateKey;
-  return sameDay ? clampSampleMinutes(delta, fallback, maxMinutes) : fallback;
+  if (!sameDay || delta > MAX_GAP_MIN) return 0;
+  return clampSampleMinutes(delta, fallback, maxMinutes);
 }
-function sumCoveredMinutes(readings, fallback = 1, maxMinutes = 10) {
+function sumCoveredMinutes(readings, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   if (!readings || readings.length === 0) return 0;
   const sorted = [...readings].sort((a, b) => a.dt - b.dt);
   let total = 0;
   for (let i = 0; i < sorted.length; i++) total += getSampleMinutes(sorted, i, fallback, maxMinutes);
   return Math.min(1440, Math.round(total));
 }
-function collectWindowByMinutes(readings, startIndex, windowMinutes, fallback = 1, maxMinutes = 10) {
+function computeCoverage(readings) {
+  const sorted = [...(readings || [])].sort((a, b) => a.dt - b.dt);
+  let total = 0;
+  let night = 0;
+  let day = 0;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const gapMin = (sorted[i + 1].dt - sorted[i].dt) / 60000;
+    if (gapMin <= 0 || gapMin > MAX_GAP_MIN) continue;
+    total += gapMin;
+    const h = sorted[i].hour;
+    if (h >= NIGHT_START && h <= NIGHT_END) night += gapMin;
+    if (h >= 8 && h <= 22) day += gapMin;
+  }
+  return {
+    totalMinutes: Math.round(total),
+    nightMinutes: Math.round(night),
+    dayMinutes: Math.round(day),
+    coverageTotal: Math.round(Math.min(100, (total / 1440) * 100)),
+    coverageNight: Math.round(Math.min(100, (night / ((NIGHT_END - NIGHT_START + 1) * 60)) * 100)),
+    coverageDay: Math.round(Math.min(100, (day / (15 * 60)) * 100)),
+  };
+}
+function collectWindowByMinutes(readings, startIndex, windowMinutes, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   const bucket = [];
   let total = 0;
   for (let i = startIndex; i < readings.length && total < windowMinutes; i++) {
@@ -249,7 +452,7 @@ function collectWindowByMinutes(readings, startIndex, windowMinutes, fallback = 
   }
   return { readings: bucket, minutes: total };
 }
-function meanWeightedByMinutes(readings, fallback = 1, maxMinutes = 10) {
+function meanWeightedByMinutes(readings, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   if (!readings || readings.length === 0) return 0;
   let totalMinutes = 0;
   let total = 0;
@@ -260,7 +463,7 @@ function meanWeightedByMinutes(readings, fallback = 1, maxMinutes = 10) {
   }
   return totalMinutes > 0 ? total / totalMinutes : meanArr(readings.map(r => r.bpm));
 }
-function stdWeightedByMinutes(readings, fallback = 1, maxMinutes = 10) {
+function stdWeightedByMinutes(readings, fallback = 1, maxMinutes = MAX_GAP_MIN) {
   if (!readings || readings.length < 2) return 0;
   const m = meanWeightedByMinutes(readings, fallback, maxMinutes);
   let totalMinutes = 0;
@@ -406,6 +609,437 @@ function calculateWakeSpike(readings, nightMeanHR, dynamicBaseline) {
   return spike > 0 ? Math.round(spike) : null;
 }
 
+function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, coverageStats) {
+  const coverage = coverageStats.coverageTotal;
+  const nightCoverage = coverageStats.coverageNight;
+  const dayCoverage = coverageStats.coverageDay;
+  const nightReadings = readings.filter(r => r.hour >= NIGHT_START && r.hour <= NIGHT_END + 1);
+  const nightSignalReadings = nightReadings.filter(r => r.hour <= NIGHT_END);
+  const dayReadings = readings.filter(r => r.hour >= 8 && r.hour <= 22);
+  const allBpm = readings.map(r => r.bpm);
+  const nightCoveredMinutes = coverageStats.nightMinutes;
+  const dayCoveredMinutes = coverageStats.dayMinutes;
+  const hasNightData = nightCoveredMinutes >= 45;
+  const hasDayData = dayCoveredMinutes >= 60;
+  const nightMeanHR = hasNightData ? meanWeightedByMinutes(nightSignalReadings, 1, 5) : null;
+  const nightStdHR = hasNightData ? stdWeightedByMinutes(nightSignalReadings, 1, 5) : null;
+  const nightMinHR = hasNightData ? Math.min(...nightSignalReadings.map(r => r.bpm)) : null;
+  const nightMaxHR = hasNightData ? Math.max(...nightSignalReadings.map(r => r.bpm)) : null;
+  const dayMeanHR = meanWeightedByMinutes(readings, 1, 5);
+  const dayMinHR = Math.min(...allBpm);
+
+  const activity = calculateTRIMP(readings, currentRestingHR, maxHR);
+  const nadirHour = computeNadirTiming(nightReadings);
+  const eveningDecay = computeEveningDecay(readings);
+
+  let pulseStability = null;
+  let nightVolatilityPercent = null;
+  if (hasNightData) {
+    const cv = (nightStdHR / nightMeanHR) * 100;
+    nightVolatilityPercent = Math.round(cv * 10) / 10;
+    pulseStability = Math.min(100, Math.max(0, Math.round(100 - ((cv - 2) * 15))));
+  }
+
+  const wakeSpike = nightMeanHR !== null
+    ? calculateWakeSpike(readings, nightMeanHR, currentRestingHR)
+    : null;
+
+  let daytimeBelowBaselinePct = null;
+  if (hasDayData) {
+    const threshold = currentRestingHR + 10;
+    let belowMinutes = 0;
+    let totalDayMinutes = 0;
+    for (let i = 0; i < dayReadings.length; i++) {
+      const minutes = getSampleMinutes(dayReadings, i, 1, 5);
+      totalDayMinutes += minutes;
+      if (dayReadings[i].bpm < threshold) belowMinutes += minutes;
+    }
+    daytimeBelowBaselinePct = totalDayMinutes > 0 ? (belowMinutes / totalDayMinutes) * 100 : null;
+  }
+
+  let idleStressMinutes = null;
+  if (hasDayData && (activity.level === "rest" || activity.level === "light")) {
+    const idleReadings = readings.filter(r => r.hour >= 8 && r.hour <= 20).sort((a, b) => a.dt - b.dt);
+    const elevThreshold = currentRestingHR + 25;
+    let stressMinutes = 0;
+    let streakMinutes = 0;
+    for (let i = 0; i < idleReadings.length; i++) {
+      const minutes = getSampleMinutes(idleReadings, i, 1, 5);
+      const gapMinutes = i > 0 ? (idleReadings[i].dt - idleReadings[i - 1].dt) / 60000 : 0;
+      if (idleReadings[i].bpm > elevThreshold) {
+        streakMinutes = (i === 0 || gapMinutes <= 10) ? streakMinutes + minutes : minutes;
+        if (streakMinutes >= 15) stressMinutes += minutes;
+      } else {
+        streakMinutes = 0;
+      }
+    }
+    idleStressMinutes = Math.round(stressMinutes);
+  }
+
+  return {
+    dayMeanHR: Math.round(dayMeanHR),
+    dayMinHR,
+    nightMeanHR: nightMeanHR !== null ? Math.round(nightMeanHR) : null,
+    nightStdHR: nightStdHR !== null ? Math.round(nightStdHR * 10) / 10 : null,
+    nightMinHR,
+    nightMaxHR,
+    dynamicBaseline: Math.round(currentRestingHR * 10) / 10,
+    baselineDelta: nightMeanHR !== null ? Math.round((nightMeanHR - currentRestingHR) * 10) / 10 : null,
+    daytimeBelowBaselinePct: daytimeBelowBaselinePct !== null ? Math.round(daytimeBelowBaselinePct) : null,
+    coverageTotal: coverage,
+    coverageNight: nightCoverage,
+    coverageDay: dayCoverage,
+    readingCount: readings.length,
+    activeMinutes: activity.activeMinutes,
+    peakHR: activity.peakHR,
+    trimp: activity.trimp,
+    activityLevel: activity.level,
+    nadirHour,
+    eveningDecay,
+    pulseStability,
+    nightVolatilityPercent,
+    wakeSpike,
+    idleStressMinutes,
+    hasNightData,
+    hasDayData,
+  };
+}
+
+function computeScoresFromRaw(rawMetrics, baseline, readings) {
+  let recoveryQuality = 50;
+  if (rawMetrics.hasNightData && rawMetrics.nightMeanHR !== null && rawMetrics.nightStdHR !== null) {
+    const depth = rawMetrics.dynamicBaseline - rawMetrics.nightMeanHR;
+    const stability = Math.max(0, 10 - rawMetrics.nightStdHR);
+    recoveryQuality = Math.min(100, Math.max(0, 50 + depth * 3 + stability * 2));
+  }
+
+  let autonomicLoad = 25;
+  if (rawMetrics.hasNightData && rawMetrics.nightMeanHR !== null && rawMetrics.nightStdHR !== null) {
+    const elevation = rawMetrics.nightMeanHR - rawMetrics.dynamicBaseline;
+    const instability = rawMetrics.nightStdHR - baseline.std;
+    autonomicLoad = Math.min(100, Math.max(0, 25 + elevation * 3 + instability * 4));
+  }
+
+  const cardioEfficiency = rawMetrics.daytimeBelowBaselinePct !== null
+    ? Math.min(100, Math.max(0, rawMetrics.daytimeBelowBaselinePct))
+    : 50;
+
+  let stressSignature = 50;
+  const eveningReadings = readings.filter(r => r.hour >= 20 && r.hour <= 23);
+  const earlyMorningReadings = readings.filter(r => r.hour >= 6 && r.hour <= 7);
+  const hasEvening = sumCoveredMinutes(eveningReadings, 1, 5) >= 20;
+  const hasMorning = sumCoveredMinutes(earlyMorningReadings, 1, 5) >= 15;
+  if (hasEvening || hasMorning) {
+    const eveningElev = hasEvening ? meanArr(eveningReadings.map(r => r.bpm)) - rawMetrics.dynamicBaseline : 0;
+    const morningElev = hasMorning ? meanArr(earlyMorningReadings.map(r => r.bpm)) - rawMetrics.dynamicBaseline : 0;
+    const weightedElev = hasEvening && hasMorning
+      ? eveningElev * 0.7 + morningElev * 0.3
+      : hasEvening ? eveningElev : morningElev;
+    stressSignature = Math.min(100, Math.max(0, 30 + weightedElev * 3));
+  }
+
+  return {
+    recoveryQuality: Math.round(recoveryQuality),
+    autonomicLoad: Math.round(autonomicLoad),
+    cardioEfficiency: Math.round(cardioEfficiency),
+    stressSignature: Math.round(stressSignature),
+    recoveryDebt: 30,
+    pulseStability: rawMetrics.pulseStability,
+    acwr: null,
+  };
+}
+
+function computeDriversFromDay(day) {
+  const raw = day.rawMetrics || {};
+  const drivers = [];
+  if ((raw.coverageTotal ?? 0) < 80) drivers.push("low_coverage");
+  if (raw.nightMeanHR !== null && raw.nightMeanHR > raw.dynamicBaseline + 3) drivers.push("elevated_night_hr");
+  if (raw.nadirHour !== null && raw.nadirHour > 5) drivers.push("late_nadir");
+  if (raw.eveningDecay !== null && raw.eveningDecay > -0.02) drivers.push("flat_evening");
+  if (day.pulseStability !== null && day.pulseStability < 50) drivers.push("low_pulse_stability");
+  if (raw.nightVolatilityPercent !== null && raw.nightVolatilityPercent > 8) drivers.push("high_night_volatility");
+  if (raw.wakeSpike !== null && raw.wakeSpike > 30) drivers.push("high_wake_spike");
+  if (raw.idleStressMinutes !== null && raw.idleStressMinutes > 45) drivers.push("high_idle_stress");
+  if (raw.activityLevel === "workout" || raw.activityLevel === "moderate") drivers.push("hard_training_day");
+  if (raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5) drivers.push("good_nadir");
+  if (raw.eveningDecay !== null && raw.eveningDecay < -0.10) drivers.push("good_evening_drop");
+  if (day.pulseStability !== null && day.pulseStability >= 70) drivers.push("stable_pulse");
+  if (raw.wakeSpike !== null && raw.wakeSpike <= 25) drivers.push("smooth_wake");
+  if (raw.idleStressMinutes !== null && raw.idleStressMinutes <= 10) drivers.push("calm_day");
+  return drivers;
+}
+
+function buildDayRecord(date, rawMetrics, scores, drivers, coverageStats, currentRestingHR, incomplete = false) {
+  const confidenceLevel = confidence(coverageStats.coverageNight);
+  return {
+    date,
+    incomplete,
+    confidence: confidenceLevel,
+    rawMetrics,
+    scores,
+    trends: {},
+    recommendations: [],
+    coverage: rawMetrics.coverageTotal,
+    coverageTotal: rawMetrics.coverageTotal,
+    coverageNight: rawMetrics.coverageNight,
+    coverageDay: rawMetrics.coverageDay,
+    dynamicBaseline: rawMetrics.dynamicBaseline ?? Math.round(currentRestingHR * 10) / 10,
+    recoveryQuality: scores.recoveryQuality,
+    autonomicLoad: scores.autonomicLoad,
+    cardioEfficiency: scores.cardioEfficiency,
+    stressSignature: scores.stressSignature,
+    recoveryDebt: scores.recoveryDebt,
+    pulseStability: scores.pulseStability,
+    acwr: scores.acwr,
+    dayMeanHR: rawMetrics.dayMeanHR ?? null,
+    dayMinHR: rawMetrics.dayMinHR ?? null,
+    nightMeanHR: rawMetrics.nightMeanHR ?? null,
+    readingCount: rawMetrics.readingCount ?? 0,
+    activityLevel: rawMetrics.activityLevel ?? "rest",
+    activeMinutes: rawMetrics.activeMinutes ?? 0,
+    peakHR: rawMetrics.peakHR ?? 0,
+    trimp: rawMetrics.trimp ?? 0,
+    hasWorkout: rawMetrics.activityLevel === "workout",
+    nadirHour: rawMetrics.nadirHour ?? null,
+    eveningDecay: rawMetrics.eveningDecay ?? null,
+    nightVolatilityPercent: rawMetrics.nightVolatilityPercent ?? null,
+    wakeSpike: rawMetrics.wakeSpike ?? null,
+    idleStressMinutes: rawMetrics.idleStressMinutes ?? null,
+    drivers,
+  };
+}
+
+function attachRollingTrends(days) {
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) continue;
+    days[i].trends = {
+      nightHr7d: rollingWeightedMean(days, i, "nightMeanHR", 7),
+      nightHr14d: rollingWeightedMean(days, i, "nightMeanHR", 14),
+      recovery7d: rollingWeightedMean(days, i, "recoveryQuality", 7),
+      recovery14d: rollingWeightedMean(days, i, "recoveryQuality", 14),
+      stress7d: rollingWeightedMean(days, i, "stressSignature", 7),
+      stress14d: rollingWeightedMean(days, i, "stressSignature", 14),
+      coverageNight7d: rollingMean(days, i, "coverageNight", 7, d => !d.incomplete && d.coverageNight !== null && d.coverageNight !== undefined),
+    };
+  }
+
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) continue;
+    const windowStart = Math.max(0, i - 4);
+    const win = days.slice(windowStart, i + 1).filter(d => !d.incomplete && d.nightMeanHR !== null && d.confidence !== "low");
+    if (win.length >= 2) {
+      const recentNightMean = weightedMean(win.map(d => d.nightMeanHR), (_, idx) => getCoverageWeight(win[idx]));
+      const drift = recentNightMean - days[i].dynamicBaseline;
+      days[i].scores.recoveryDebt = Math.min(100, Math.max(0, 30 + drift * 6));
+      days[i].recoveryDebt = Math.round(days[i].scores.recoveryDebt);
+    }
+  }
+
+  const rawLoads = days.map(d => d.incomplete ? null : d.autonomicLoad);
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) continue;
+    const window = [];
+    for (let j = Math.max(0, i - 1); j <= Math.min(days.length - 1, i + 1); j++) {
+      if (!days[j].incomplete && rawLoads[j] !== null) window.push(rawLoads[j]);
+    }
+    if (window.length > 0) {
+      const smoothed = Math.round(meanArr(window));
+      days[i].scores.autonomicLoad = smoothed;
+      days[i].autonomicLoad = smoothed;
+    }
+  }
+
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) { days[i].scores.acwr = null; days[i].acwr = null; continue; }
+    const acuteWin = days.slice(Math.max(0, i - 6), i + 1).filter(d => !d.incomplete);
+    const chronicWin = days.slice(Math.max(0, i - 27), i + 1).filter(d => !d.incomplete);
+    if (acuteWin.length < 4 || chronicWin.length < 14) { days[i].scores.acwr = null; days[i].acwr = null; continue; }
+    const acuteLoad = meanArr(acuteWin.map(d => d.trimp));
+    const chronicLoad = meanArr(chronicWin.map(d => d.trimp));
+    const acwr = chronicLoad > 0 ? Math.round((acuteLoad / chronicLoad) * 100) / 100 : null;
+    days[i].scores.acwr = acwr;
+    days[i].acwr = acwr;
+  }
+}
+
+function buildRecommendation(id, severity, confidenceLevel, title, why, evidence, actions) {
+  return { id, severity, confidence: confidenceLevel, title, why, evidence, actions };
+}
+
+function generateDayRecommendations(day, prevDay, context = {}) {
+  if (!day || day.incomplete) return [];
+  const recs = [];
+  const trends = day.trends || {};
+  const baseline = context.baseline;
+  if (
+    trends.recovery7d !== null &&
+    trends.recovery14d !== null &&
+    trends.recovery7d < trends.recovery14d - 6 &&
+    trends.nightHr7d !== null &&
+    baseline &&
+    trends.nightHr7d > baseline.restingHR + 4 &&
+    (trends.coverageNight7d ?? 0) >= 60
+  ) {
+    recs.push(buildRecommendation(
+      "recovery_decline_elevated_night_hr",
+      "high",
+      day.confidence,
+      "Recovery is trending down",
+      "Your recent overnight heart rate is running above baseline while recovery has declined versus the longer trend.",
+      [
+        `Recovery 7d ${Math.round(trends.recovery7d)} vs 14d ${Math.round(trends.recovery14d)}`,
+        `Night HR 7d ${Math.round(trends.nightHr7d)} bpm vs baseline ${baseline.restingHR}`,
+        `Night coverage 7d ${Math.round(trends.coverageNight7d)}%`,
+      ],
+      [
+        "Hold bedtime within 30 minutes for 3 nights",
+        "Skip late alcohol and heavy meals this week",
+        "Reduce one hard session if training has been heavy",
+      ]
+    ));
+  }
+  if (day.activityLevel === "rest" && day.stressSignature > 60) {
+    recs.push(buildRecommendation(
+      "high_stress_rest_days",
+      "moderate",
+      day.confidence,
+      "Stress remains high on rest days",
+      "Your evening or early-morning heart rate stayed elevated without exercise to explain it.",
+      [
+        `Stress score ${day.stressSignature}`,
+        `Night HR delta ${day.rawMetrics?.baselineDelta ?? "n/a"} bpm`,
+      ],
+      [
+        "Build a lighter evening routine",
+        "Stop caffeine earlier in the day",
+        "Use a 10-minute walk after dinner",
+      ]
+    ));
+  }
+  if (day.nadirHour !== null && day.nadirHour > 5) {
+    recs.push(buildRecommendation(
+      "late_nadir_pattern",
+      "moderate",
+      day.confidence,
+      "Your system calmed down late",
+      "The overnight low point arrived later than ideal, which often reflects late load on the system.",
+      [
+        `Nadir at ~${day.nadirHour.toFixed(1)}h`,
+        `Coverage night ${day.coverageNight}%`,
+      ],
+      [
+        "Finish eating 2–3 hours before bed",
+        "Avoid alcohol close to sleep",
+      ]
+    ));
+  }
+  if (day.eveningDecay !== null && day.eveningDecay > -0.02) {
+    recs.push(buildRecommendation(
+      "flat_evening_pattern",
+      "moderate",
+      day.confidence,
+      "Your evening wind-down looked flat",
+      "Heart rate did not fall much between 8pm and 11pm.",
+      [
+        `Evening slope ${day.eveningDecay} bpm/min`,
+      ],
+      [
+        "Dim lights earlier",
+        "Avoid work and screens late",
+      ]
+    ));
+  }
+  if (day.acwr !== null && day.acwr > 1.5) {
+    recs.push(buildRecommendation(
+      "training_load_spike",
+      "high",
+      day.confidence,
+      "Training load is spiking",
+      "Recent workload is much higher than your rolling baseline.",
+      [
+        `ACWR ${day.acwr}`,
+        `TRIMP ${day.trimp}`,
+      ],
+      [
+        "Deload for several days",
+        "Prioritize sleep and hydration",
+      ]
+    ));
+  }
+  if (day.confidence === "low") {
+    recs.push(buildRecommendation(
+      "low_confidence_data_quality",
+      "low",
+      "low",
+      "Low confidence day",
+      "Night coverage was limited, so interpretations are more directional than definitive.",
+      [
+        `Night coverage ${day.coverageNight}%`,
+      ],
+      [
+        "Treat this day as a weak signal",
+        "Look at the surrounding trend instead of the single day",
+      ]
+    ));
+  }
+  return recs;
+}
+
+function generateRangeRecommendations(days, baseline) {
+  const valid = (days || []).filter(d => !d.incomplete);
+  if (valid.length === 0) return [];
+  const recs = [];
+  const summary = summarizeRange(valid, baseline);
+  const confidenceSummary = summarizeConfidence(valid);
+  const latest = valid[valid.length - 1];
+  if (latest) recs.push(...generateDayRecommendations(latest, valid[valid.length - 2] || null, { baseline }));
+  if (summary.avgStress > 60 && valid.filter(d => d.activityLevel === "rest" && d.stressSignature > 55).length >= 3) {
+    recs.push(buildRecommendation(
+      "month_high_stress_rest_days",
+      "high",
+      confidenceSummary.label === "Weak" ? "low" : "medium",
+      "Rest-day stress is a month-level theme",
+      "Stress stayed elevated even on easier days, which points more to life load than training load.",
+      [
+        `${valid.filter(d => d.activityLevel === "rest" && d.stressSignature > 55).length} stressed rest days`,
+        `Weighted month stress ${Math.round(summary.avgStress)}`,
+      ],
+      [
+        "Protect a calmer evening routine this week",
+        "Move intense sessions earlier in the day",
+      ]
+    ));
+  }
+  if (confidenceSummary.lowConfidenceDays / valid.length > 0.3) {
+    recs.push(buildRecommendation(
+      "month_low_confidence",
+      "low",
+      "low",
+      "Data quality limits this month",
+      "A meaningful share of nights had weak coverage, so conclusions should be treated as directional.",
+      [
+        `${confidenceSummary.lowConfidenceDays} low-confidence days`,
+        `${confidenceSummary.sufficientNightPct}% of nights had sufficient night coverage`,
+      ],
+      [
+        "Use the month trend, not isolated days",
+      ]
+    ));
+  }
+  return recs;
+}
+
+function pickPrimaryRecommendation(recommendations) {
+  if (!recommendations || recommendations.length === 0) return null;
+  const severityRank = { high: 3, moderate: 2, low: 1 };
+  const confidenceRank = { high: 3, medium: 2, low: 1 };
+  return [...recommendations].sort((a, b) => {
+    const sevDiff = (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0);
+    if (sevDiff !== 0) return sevDiff;
+    return (confidenceRank[b.confidence] || 0) - (confidenceRank[a.confidence] || 0);
+  })[0];
+}
+
 function computeDailySignals(days, baseline, maxHR) {
   const dateKeys = Object.keys(days).sort();
   const dailySignals = [];
@@ -417,227 +1051,63 @@ function computeDailySignals(days, baseline, maxHR) {
 
   for (const dk of dateKeys) {
     const readings = days[dk];
-    const coveredMinutes = sumCoveredMinutes(readings);
-    const coverage = Math.round((coveredMinutes / 1440) * 100);
+    const coverageStats = computeCoverage(readings);
+    const coveredMinutes = coverageStats.totalMinutes;
 
     if (coveredMinutes < 60) {
-dailySignals.push({ date: dk, incomplete: true, coverage, drivers: ["low_coverage"] });
+      const rawMetrics = {
+        dayMeanHR: null,
+        dayMinHR: null,
+        nightMeanHR: null,
+        nightStdHR: null,
+        nightMinHR: null,
+        nightMaxHR: null,
+        dynamicBaseline: Math.round(currentRestingHR * 10) / 10,
+        baselineDelta: null,
+        daytimeBelowBaselinePct: null,
+        coverageTotal: coverageStats.coverageTotal,
+        coverageNight: coverageStats.coverageNight,
+        coverageDay: coverageStats.coverageDay,
+        readingCount: readings.length,
+        activeMinutes: 0,
+        peakHR: 0,
+        trimp: 0,
+        activityLevel: "rest",
+        nadirHour: null,
+        eveningDecay: null,
+        pulseStability: null,
+        nightVolatilityPercent: null,
+        wakeSpike: null,
+        idleStressMinutes: null,
+        hasNightData: false,
+        hasDayData: false,
+      };
+      const scores = { recoveryQuality: 50, autonomicLoad: 25, cardioEfficiency: 50, stressSignature: 50, recoveryDebt: 30, pulseStability: null, acwr: null };
+      dailySignals.push(buildDayRecord(dk, rawMetrics, scores, ["low_coverage"], coverageStats, currentRestingHR, true));
       // Still update EWMA with whatever night data exists
-      const nightBpmPartial = readings.filter(r => r.hour >= 1 && r.hour <= 5).map(r => r.bpm);
+      const nightBpmPartial = readings.filter(r => r.hour >= NIGHT_START && r.hour <= NIGHT_END).map(r => r.bpm);
       if (nightBpmPartial.length >= 5) {
         currentRestingHR = meanArr(nightBpmPartial) * alpha + currentRestingHR * (1 - alpha);
       }
       continue;
     }
 
-    // Night window: 1–6am (extended for nadir timing)
-    const nightReadings = readings.filter(r => r.hour >= 1 && r.hour <= 6);
-    const nightSignalReadings = nightReadings.filter(r => r.hour <= 5);
-    const nightBpm = nightSignalReadings.map(r => r.bpm); // 1–5am for signals
-    const dayReadings = readings.filter(r => r.hour >= 8 && r.hour <= 22);
-    const dayBpm = dayReadings.map(r => r.bpm);
-    const allBpm = readings.map(r => r.bpm);
-    const nightCoveredMinutes = sumCoveredMinutes(nightSignalReadings, 1, 5);
-    const dayCoveredMinutes = sumCoveredMinutes(dayReadings, 1, 5);
-    const hasNightData = nightCoveredMinutes >= 45;
-    const hasDayData = dayCoveredMinutes >= 60;
-
-    // --- Signal 1: Recovery Quality (higher = better) ---
-    // Uses dynamic baseline so a fitter person's new normal doesn't look like poor recovery.
-    let recoveryQuality = 50;
-    if (hasNightData) {
-      const nightMean = meanWeightedByMinutes(nightSignalReadings, 1, 5);
-      const nightStd = stdWeightedByMinutes(nightSignalReadings, 1, 5);
-      const depth = currentRestingHR - nightMean; // positive = deeper sleep vs current norm
-      const stability = Math.max(0, 10 - nightStd);
-      recoveryQuality = Math.min(100, Math.max(0, 50 + depth * 3 + stability * 2));
-    }
-
-    // --- Signal 2: Autonomic Load (higher = worse) ---
-    let autonomicLoad = 25;
-    if (hasNightData) {
-      const nMean = meanWeightedByMinutes(nightSignalReadings, 1, 5);
-      const nStd = stdWeightedByMinutes(nightSignalReadings, 1, 5);
-      const elevation = nMean - currentRestingHR;
-      const instability = nStd - baseline.std;
-      autonomicLoad = Math.min(100, Math.max(0, 25 + elevation * 3 + instability * 4));
-    }
-
-    // --- Signal 3: Cardiovascular Efficiency (higher = better) ---
-    let cardioEfficiency = 50;
-    if (hasDayData) {
-      const threshold = currentRestingHR + 10;
-      let belowMinutes = 0;
-      let totalDayMinutes = 0;
-      for (let i = 0; i < dayReadings.length; i++) {
-        const minutes = getSampleMinutes(dayReadings, i, 1, 5);
-        totalDayMinutes += minutes;
-        if (dayReadings[i].bpm < threshold) belowMinutes += minutes;
-      }
-      cardioEfficiency = totalDayMinutes > 0 ? Math.min(100, Math.max(0, (belowMinutes / totalDayMinutes) * 100)) : 50;
-    }
-
-    // --- Signal 4: Stress Signature (higher = worse) ---
-    let stressSignature = 50;
-    const eveningReadings = readings.filter(r => r.hour >= 20 && r.hour <= 23);
-    const eveningBpm = eveningReadings.map(r => r.bpm);
-    const earlyMorningReadings = readings.filter(r => r.hour >= 6 && r.hour <= 7);
-    const morningBpm = earlyMorningReadings.map(r => r.bpm);
-    const hasEvening = sumCoveredMinutes(eveningReadings, 1, 5) >= 20;
-    const hasMorning = sumCoveredMinutes(earlyMorningReadings, 1, 5) >= 15;
-    if (hasEvening || hasMorning) {
-      const eveningElev = hasEvening ? meanArr(eveningBpm) - currentRestingHR : 0;
-      const morningElev = hasMorning ? meanArr(morningBpm) - currentRestingHR : 0;
-      const weightedElev = hasEvening && hasMorning
-        ? eveningElev * 0.7 + morningElev * 0.3
-        : hasEvening ? eveningElev : morningElev;
-      stressSignature = Math.min(100, Math.max(0, 30 + weightedElev * 3));
-    }
-
-    const dayMeanHR = meanWeightedByMinutes(readings, 1, 5);
-    const dayMinHR = Math.min(...allBpm);
-    const nightMeanHR = hasNightData ? meanWeightedByMinutes(nightSignalReadings, 1, 5) : null;
-
-    // Phase 5: TRIMP-based activity detection
-    const activity = calculateTRIMP(readings, currentRestingHR, maxHR);
-
-    // Phase 4: HR Nadir Timing
-    const nadirHour = computeNadirTiming(nightReadings);
-
-    // Phase 3: Evening Restitution Rate
-    const eveningDecay = computeEveningDecay(readings);
-
-    // ANS Stability: Coefficient of Variation of overnight HR.
-    // CV normalises std against the mean so it's comparable across different baseline HRs.
-    // A healthy sleeping CV is ~2–6%. Above 8% indicates autonomic restlessness.
-    let ansStability = null;
-    let nightVolatilityPercent = null;
-    if (hasNightData) {
-      const nMean = meanWeightedByMinutes(nightSignalReadings, 1, 5);
-      const nStd = stdWeightedByMinutes(nightSignalReadings, 1, 5);
-      const cv = (nStd / nMean) * 100;
-      nightVolatilityPercent = Math.round(cv * 10) / 10;
-      const score = 100 - ((cv - 2) * 15);
-      ansStability = Math.min(100, Math.max(0, Math.round(score)));
-    }
-
-    // Wake Spike: orthostatic proxy — how much HR jumps at waking vs that night's sleep HR.
-    const wakeSpike = nightMeanHR !== null
-      ? calculateWakeSpike(readings, nightMeanHR, currentRestingHR)
-      : null;
-
-    // Daytime Sympathetic Load: sustained unexplained HR elevation during non-exercise hours.
-    // Only meaningful on rest/light days — on workout days, elevated HR is expected.
-    // Counts minutes above dynamicBaseline+25 in 8am–8pm that are part of a 15+ min sustained block.
-    let idleStressMinutes = null;
-    if (hasDayData && (activity.level === "rest" || activity.level === "light")) {
-      const idleReadings = readings.filter(r => r.hour >= 8 && r.hour <= 20).sort((a, b) => a.dt - b.dt);
-      const elevThreshold = currentRestingHR + 25;
-      let stressMinutes = 0;
-      let streakMinutes = 0;
-      for (let i = 0; i < idleReadings.length; i++) {
-        const minutes = getSampleMinutes(idleReadings, i, 1, 5);
-        const gapMinutes = i > 0 ? (idleReadings[i].dt - idleReadings[i - 1].dt) / 60000 : 0;
-        if (idleReadings[i].bpm > elevThreshold) {
-          streakMinutes = (i === 0 || gapMinutes <= 10) ? streakMinutes + minutes : minutes;
-          if (streakMinutes >= 15) stressMinutes += minutes;
-        } else {
-          streakMinutes = 0;
-        }
-      }
-      idleStressMinutes = Math.round(stressMinutes);
-    }
-
-    // Build driver tags from the computed signals
-    const drivers = [];
-    if (coverage < 80) drivers.push("low_coverage");
-    if (hasNightData && nightMeanHR !== null && nightMeanHR > currentRestingHR + 3) drivers.push("elevated_night_hr");
-    if (nadirHour !== null && nadirHour > 5) drivers.push("late_nadir");
-    if (eveningDecay !== null && eveningDecay > -0.02) drivers.push("flat_evening");
-    if (ansStability !== null && ansStability < 50) drivers.push("low_ans_stability");
-    if (nightVolatilityPercent !== null && nightVolatilityPercent > 8) drivers.push("high_night_volatility");
-    if (wakeSpike !== null && wakeSpike > 30) drivers.push("high_wake_spike");
-    if (idleStressMinutes !== null && idleStressMinutes > 45) drivers.push("high_idle_stress");
-    if (activity.level === "workout" || activity.level === "moderate") drivers.push("hard_training_day");
-    if (nadirHour !== null && nadirHour >= 2 && nadirHour <= 3.5) drivers.push("good_nadir");
-    if (eveningDecay !== null && eveningDecay < -0.10) drivers.push("good_evening_drop");
-    if (ansStability !== null && ansStability >= 70) drivers.push("strong_ans_stability");
-    if (wakeSpike !== null && wakeSpike <= 25) drivers.push("smooth_wake");
-    if (idleStressMinutes !== null && idleStressMinutes <= 10) drivers.push("calm_day");
-
-    dailySignals.push({
-      date: dk, incomplete: false, coverage,
-      dynamicBaseline: Math.round(currentRestingHR * 10) / 10,
-      recoveryQuality: Math.round(recoveryQuality),
-      autonomicLoad: Math.round(autonomicLoad),
-      cardioEfficiency: Math.round(cardioEfficiency),
-      stressSignature: Math.round(stressSignature),
-      recoveryDebt: 30,
-      dayMeanHR: Math.round(dayMeanHR),
-      dayMinHR,
-      nightMeanHR: nightMeanHR !== null ? Math.round(nightMeanHR) : null,
-      readingCount: readings.length,
-      // Phase 5: TRIMP activity fields
-      activityLevel: activity.level,
-      activeMinutes: activity.activeMinutes,
-      peakHR: activity.peakHR,
-      trimp: activity.trimp,
-      hasWorkout: activity.level === "workout",
-      // Phase 4: Nadir timing
-      nadirHour,
-      // Phase 3: Evening restitution rate
-      eveningDecay,
-      // ANS Stability (CV-based overnight rhythm coherence)
-      ansStability,
-      nightVolatilityPercent,
-      // Wake Spike (orthostatic proxy)
-      wakeSpike,
-      // Daytime Sympathetic Load (unexplained idle elevation)
-      idleStressMinutes,
-      drivers,
-    });
+    const rawMetrics = computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, coverageStats);
+    const scores = computeScoresFromRaw(rawMetrics, baseline, readings);
+    const provisionalDay = buildDayRecord(dk, rawMetrics, scores, [], coverageStats, currentRestingHR, false);
+    provisionalDay.drivers = computeDriversFromDay(provisionalDay);
+    dailySignals.push(provisionalDay);
 
     // Update EWMA after this day's signals are computed
     // (today's signals compare against yesterday's baseline)
-    if (hasNightData) {
-      currentRestingHR = meanArr(nightBpm) * alpha + currentRestingHR * (1 - alpha);
+    if (rawMetrics.hasNightData) {
+      currentRestingHR = rawMetrics.nightMeanHR * alpha + currentRestingHR * (1 - alpha);
     }
   }
 
-  // Recovery Debt: rolling 5-day resting HR trend, referenced against dynamic baseline
+  attachRollingTrends(dailySignals);
   for (let i = 0; i < dailySignals.length; i++) {
-    if (dailySignals[i].incomplete) continue;
-    const windowStart = Math.max(0, i - 4);
-    const win = dailySignals.slice(windowStart, i + 1).filter(d => !d.incomplete && d.nightMeanHR !== null);
-    if (win.length >= 2) {
-      const recentNightMean = meanArr(win.map(d => d.nightMeanHR));
-      const drift = recentNightMean - dailySignals[i].dynamicBaseline;
-      dailySignals[i].recoveryDebt = Math.min(100, Math.max(0, 30 + drift * 6));
-    }
-  }
-
-  // Smooth autonomic load with 3-day rolling average
-  const rawLoads = dailySignals.map(d => d.incomplete ? null : d.autonomicLoad);
-  for (let i = 0; i < dailySignals.length; i++) {
-    if (dailySignals[i].incomplete) continue;
-    const window = [];
-    for (let j = Math.max(0, i - 1); j <= Math.min(dailySignals.length - 1, i + 1); j++) {
-      if (!dailySignals[j].incomplete && rawLoads[j] !== null) window.push(rawLoads[j]);
-    }
-    if (window.length > 0) dailySignals[i].autonomicLoad = Math.round(meanArr(window));
-  }
-
-  // Phase 6: ACWR — Acute (7-day) / Chronic (28-day) TRIMP ratio.
-  // Sweet spot 0.8–1.3. Below 0.8 = detraining. Above 1.5 = overreach risk.
-  // Requires ≥4 acute days and ≥14 chronic days to be meaningful.
-  for (let i = 0; i < dailySignals.length; i++) {
-    if (dailySignals[i].incomplete) { dailySignals[i].acwr = null; continue; }
-    const acuteWin  = dailySignals.slice(Math.max(0, i - 6),  i + 1).filter(d => !d.incomplete);
-    const chronicWin = dailySignals.slice(Math.max(0, i - 27), i + 1).filter(d => !d.incomplete);
-    if (acuteWin.length < 4 || chronicWin.length < 14) { dailySignals[i].acwr = null; continue; }
-    const acuteLoad   = meanArr(acuteWin.map(d => d.trimp));
-    const chronicLoad = meanArr(chronicWin.map(d => d.trimp));
-    dailySignals[i].acwr = chronicLoad > 0 ? Math.round((acuteLoad / chronicLoad) * 100) / 100 : null;
+    dailySignals[i].recommendations = generateDayRecommendations(dailySignals[i], dailySignals[i - 1] || null, { baseline });
   }
 
   return dailySignals;
@@ -938,13 +1408,16 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
   const valid = monthSignals.filter(d => !d.incomplete);
   if (valid.length < 5) return { summary: "Not enough data this month for a meaningful assessment.", notes: [], guidance: [], callouts: [] };
 
-  const avgRecovery = meanArr(valid.map(d => d.recoveryQuality));
-  const avgStress = meanArr(valid.map(d => d.stressSignature));
-  const avgLoad = meanArr(valid.map(d => d.autonomicLoad));
-  const avgEfficiency = meanArr(valid.map(d => d.cardioEfficiency));
-  const avgDebt = meanArr(valid.map(d => d.recoveryDebt));
-  const nightMeans = valid.filter(d => d.nightMeanHR !== null).map(d => d.nightMeanHR);
-  const monthRestingHR = nightMeans.length > 0 ? Math.round(meanArr(nightMeans)) : null;
+  const rangeSummary = summarizeRange(valid, baseline);
+  const avgRecovery = rangeSummary.avgRecovery;
+  const avgStress = rangeSummary.avgStress;
+  const avgLoad = rangeSummary.avgLoad;
+  const avgEfficiency = rangeSummary.avgEfficiency;
+  const avgDebt = rangeSummary.avgDebt;
+  const monthRestingHR = rangeSummary.monthRestingHR;
+  const rangeRecommendations = generateRangeRecommendations(valid, baseline);
+  const primaryRecommendation = pickPrimaryRecommendation(rangeRecommendations);
+  const dataQualitySummary = rangeSummary.dataQuality;
 
   const notes = [];
   const guidance = [];
@@ -1111,19 +1584,19 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     }
   }
 
-  // ── ANS Stability (overnight rhythm coherence) ──
-  const ansDays = valid.filter(d => d.ansStability !== null);
-  if (ansDays.length >= 5) {
-    const avgAns = meanArr(ansDays.map(d => d.ansStability));
-    const avgCv  = meanArr(ansDays.map(d => d.nightVolatilityPercent));
-    const chaoticNights = ansDays.filter(d => d.nightVolatilityPercent > 8).length;
-    if (avgAns >= 70) {
-      notes.push({ icon: "✦", text: `Strong nervous system coherence overnight (avg ANS Stability ${Math.round(avgAns)}, CV ${avgCv.toFixed(1)}%). Your sleeping HR ran in a tight, stable rhythm — the hallmark of a well-recovered autonomic system.` });
-    } else if (chaoticNights >= ansDays.length * 0.3) {
-      notes.push({ icon: "△", text: `Disrupted overnight rhythm on ${chaoticNights} nights this month (CV >8%). Even when average overnight HR looked normal, your nervous system was oscillating — a sign of alcohol, illness, late food, or accumulated stress suppressing your body's ability to stabilise.` });
-      guidance.push("Chaotic overnight HR rhythm (high CV) is distinct from elevated HR — it means your autonomic system couldn't settle into a slow, steady beat. The most common trigger is alcohol within 4 hours of sleep, followed by heavy meals and high emotional stress. Tracking which evenings correlate with your most volatile nights often reveals a clear pattern within 2–3 weeks.");
-    } else if (avgAns < 50) {
-      notes.push({ icon: "—", text: `Moderate ANS stability this month (avg ${Math.round(avgAns)}, CV ${avgCv.toFixed(1)}%). Your overnight HR showed more oscillation than ideal — your nervous system was working harder than it should be during sleep.` });
+  // ── Pulse Stability (overnight rhythm coherence) ──
+  const pulseDays = valid.filter(d => d.pulseStability !== null);
+  if (pulseDays.length >= 5) {
+    const avgPulse = meanArr(pulseDays.map(d => d.pulseStability));
+    const avgCv  = meanArr(pulseDays.map(d => d.nightVolatilityPercent));
+    const chaoticNights = pulseDays.filter(d => d.nightVolatilityPercent > 8).length;
+    if (avgPulse >= 70) {
+      notes.push({ icon: "✦", text: `Strong overnight pulse stability (avg ${Math.round(avgPulse)}, variation ${avgCv.toFixed(1)}%). Your sleeping HR ran in a tight, stable rhythm — a positive sign for recovery consistency.` });
+    } else if (chaoticNights >= pulseDays.length * 0.3) {
+      notes.push({ icon: "△", text: `Disrupted overnight pulse rhythm on ${chaoticNights} nights this month (variation >8%). Even when average overnight HR looked normal, the pattern was more erratic than usual.` });
+      guidance.push("Pulse stability is based on variation in HR readings, not inter-beat HRV. Use it as a trend indicator only: alcohol, heavy late meals, illness, and stress commonly make this pattern more chaotic.");
+    } else if (avgPulse < 50) {
+      notes.push({ icon: "—", text: `Moderate overnight pulse stability this month (avg ${Math.round(avgPulse)}, variation ${avgCv.toFixed(1)}%). Your sleeping HR showed more oscillation than ideal.` });
     }
   }
 
@@ -1160,20 +1633,20 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     for (const k of d.drivers) driverCounts[k] = (driverCounts[k] || 0) + 1;
   }
 
-  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_ans_stability"]; 
-  const winKeys = ["good_nadir", "good_evening_drop", "strong_ans_stability", "smooth_wake", "calm_day"]; 
+  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_pulse_stability"];
+  const winKeys = ["good_nadir", "good_evening_drop", "stable_pulse", "smooth_wake", "calm_day"];
 
   const labelMap = {
     elevated_night_hr: "elevated overnight HR",
     late_nadir: "late HR nadir",
     flat_evening: "flat evening wind-down",
     high_night_volatility: "chaotic overnight rhythm",
-    low_ans_stability: "low ANS stability",
+    low_pulse_stability: "low pulse stability",
     high_wake_spike: "high wake-up spike",
     high_idle_stress: "high daytime idle stress",
     good_nadir: "optimal nadir timing",
     good_evening_drop: "strong evening wind-down",
-    strong_ans_stability: "stable overnight rhythm",
+    stable_pulse: "stable overnight rhythm",
     smooth_wake: "smooth wake response",
     calm_day: "calm daytime HR",
   };
@@ -1204,7 +1677,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     const idx = sortedKeys.indexOf(currentMonthKey);
     if (idx > 0) {
       const prevKey = sortedKeys[idx - 1];
-      const prevValid = allSignals.filter(d => getMonthKey(d.date) === prevKey && !d.incomplete);
+      const prevValid = allSignals.filter(d => getMonthKey(d.date) === prevKey && !d.incomplete && d.confidence !== "low");
       const prevCounts = {};
       for (const d of prevValid) {
         if (!d.drivers) continue;
@@ -1244,7 +1717,8 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
 
   // ── Day callouts — best and worst ──
   if (valid.length >= 7) {
-    const sorted = [...valid].sort((a, b) => b.recoveryQuality - a.recoveryQuality);
+    const eligible = valid.filter(d => d.confidence !== "low");
+    const sorted = [...(eligible.length ? eligible : valid)].sort((a, b) => b.recoveryQuality - a.recoveryQuality);
     const best = sorted[0];
     const worst = sorted[sorted.length - 1];
     if (best.recoveryQuality - worst.recoveryQuality > 15) {
@@ -1274,7 +1748,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
         // Driver deltas
         const prevCounts = {};
         for (const d of prevValid) { if (d.drivers) for (const k of d.drivers) prevCounts[k] = (prevCounts[k] || 0) + 1; }
-        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_ans_stability","good_nadir","good_evening_drop","strong_ans_stability","smooth_wake","calm_day"];
+        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_pulse_stability","good_nadir","good_evening_drop","stable_pulse","smooth_wake","calm_day"];
         const driverDeltas = allDriverKeys
           .map(k => ({ k, curr: driverCounts[k] || 0, prev: prevCounts[k] || 0, delta: (driverCounts[k] || 0) - (prevCounts[k] || 0) }))
           .filter(x => Math.abs(x.delta) >= 2)
@@ -1283,6 +1757,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
         monthComparison = {
           prevMonth: fmtMonth(prevKey),
           improving: recDiff > 0 || stressDiff < 0,
+          changes: `Recovery ${recDiff > 0 ? "+" : ""}${Math.round(recDiff * 10) / 10}, stress ${stressDiff > 0 ? "+" : ""}${Math.round(stressDiff * 10) / 10}`,
           recDiff: Math.round(recDiff * 10) / 10,
           stressDiff: Math.round(stressDiff * 10) / 10,
           debtDiff: Math.round(debtDiff * 10) / 10,
@@ -1334,7 +1809,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
       { key: "elevated_night_hr",   rec: "Prioritise sleep regularity over duration this week" },
       { key: "flat_evening",        rec: "Wind down earlier — dimmer light and no screens after 9 pm" },
       { key: "high_night_volatility", rec: "Eliminate alcohol and heavy meals in the 3 hours before bed" },
-      { key: "low_ans_stability",   rec: "Space intensity and add one genuine rest day" },
+      { key: "low_pulse_stability",   rec: "Space intensity and add one genuine rest day" },
     ];
     let focusRec = null;
     let focusReason = null;
@@ -1360,19 +1835,40 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
 
   // ── Top priority ──
   let priority = null;
-  if (avgRecovery < 45) priority = { label: "Sleep & recovery", text: "Your #1 lever this month is sleep. Everything else improves when overnight recovery improves. Start with consistent timing." };
+  if (primaryRecommendation) {
+    priority = { label: primaryRecommendation.title, text: primaryRecommendation.why, confidence: primaryRecommendation.confidence };
+  } else if (avgRecovery < 45) priority = { label: "Sleep & recovery", text: "Your #1 lever this month is sleep. Everything else improves when overnight recovery improves. Start with consistent timing." };
   else if (avgStress > 60 && restHighStressDays.length > activeHighStressDays.length) priority = { label: "Stress management", text: "Your body is running hot in the evenings even on rest days. Focus on winding down earlier — this single change will cascade into better recovery and lower debt." };
   else if (avgDebt > 50) priority = { label: "Load management", text: "You're accumulating more strain than you're clearing. Introduce at least one genuine rest day per week — not active recovery, actual rest." };
   else if (avgEfficiency < 35 && totalActive < valid.length * 0.2) priority = { label: "Movement", text: "Low cardiovascular efficiency combined with few active days. Even light daily movement (walking, stretching) will bring your daytime HR down and improve all other signals." };
   else if (avgEfficiency < 35) priority = { label: "Daytime HR", text: "Your heart is working harder than it needs to during the day. Check hydration, caffeine timing, and consider adding low-intensity movement." };
 
-  return { summary, notes, guidance, callouts, monthComparison, weeklyFocus, weeklySummaries, priority, avgRecovery, avgStress, avgLoad, avgEfficiency, avgDebt, workoutCount: workoutDays.length };
+  return {
+    summary,
+    notes,
+    guidance,
+    callouts,
+    monthComparison,
+    weeklyFocus,
+    weeklySummaries,
+    priority,
+    recommendations: rangeRecommendations,
+    primaryRecommendation,
+    avgRecovery,
+    avgStress,
+    avgLoad,
+    avgEfficiency,
+    avgDebt,
+    workoutCount: workoutDays.length,
+    dataQualitySummary,
+  };
 }
 
 
 // ─── UI Components ───────────────────────────────────────────────────────
 
 function GridHeatmap({ signals, field, label, isInverse }) {
+  const T = useContext(ThemeContext);
   const valid = signals.filter(d => !d.incomplete);
   if (valid.length === 0) return null;
   const values = valid.map(d => d[field]);
@@ -1415,16 +1911,16 @@ function GridHeatmap({ signals, field, label, isInverse }) {
   for (let i = 0; i < cells.length; i += 7) {
     weeks.push(cells.slice(i, i + 7));
   }
-  const colors = ["hsl(4, 60%, 50%)", "hsl(38, 40%, 58%)", "hsl(145, 38%, 42%)"];
+  const colors = [T.warm, T.gold, T.calm];
   const dowLabels = ["M", "T", "W", "T", "F", "S", "S"];
 
   return (
     <div style={{ marginBottom: 14 }}>
-      <div style={{ fontSize: 11, color: "#8a8478", marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontSize: 11, color: T.soft, marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
       <div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 22px)", gap: 2, marginBottom: 2 }}>
           {dowLabels.map((l, i) => (
-            <div key={i} style={{ fontSize: 9, color: "#b0a898", textAlign: "center" }}>{l}</div>
+            <div key={i} style={{ fontSize: 9, color: T.faint, textAlign: "center" }}>{l}</div>
           ))}
         </div>
         {weeks.map((week, wi) => (
@@ -1432,7 +1928,7 @@ function GridHeatmap({ signals, field, label, isInverse }) {
             {Array.from({ length: 7 }, (_, di) => {
               const cell = week[di];
               if (!cell) return <div key={di} style={{ width: 22, height: 18, borderRadius: 3 }} />;
-              if (cell.empty) return <div key={di} style={{ width: 22, height: 18, borderRadius: 3, backgroundColor: "#f0ece4" }} />;
+              if (cell.empty) return <div key={di} style={{ width: 22, height: 18, borderRadius: 3, backgroundColor: T.paper }} />;
               return (
                 <div key={di} title={`${cell.day}: ${cell.value}`}
                   style={{ width: 22, height: 18, borderRadius: 3, backgroundColor: colors[cell.quality], opacity: 0.88 }} />
@@ -1446,6 +1942,7 @@ function GridHeatmap({ signals, field, label, isInverse }) {
 }
 
 function FullGridHeatmap({ signals, field, label, isInverse }) {
+  const T = useContext(ThemeContext);
   const valid = signals.filter(d => !d.incomplete);
   if (valid.length === 0) return null;
   const values = valid.map(d => d[field]);
@@ -1473,23 +1970,23 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
   for (let i = 0; i < cells.length; i += 7) {
     weeks.push(cells.slice(i, i + 7));
   }
-  const colors = ["hsl(4, 60%, 50%)", "hsl(38, 40%, 58%)", "hsl(145, 38%, 42%)"];
+  const colors = [T.warm, T.gold, T.calm];
   const dowLabels = ["M", "T", "W", "T", "F", "S", "S"];
 
   return (
     <div style={{ marginBottom: 18 }}>
-      <div style={{ fontSize: 11, color: "#8a8478", marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
+      <div style={{ fontSize: 11, color: T.soft, marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
       <div style={{ display: "flex", gap: 1, overflowX: "auto", WebkitOverflowScrolling: "touch", paddingBottom: 4 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 1, marginRight: 4 }}>
           {dowLabels.map((l, i) => (
-            <div key={i} style={{ width: 12, height: 13, fontSize: 9, color: "#b0a898", display: "flex", alignItems: "center", justifyContent: "center" }}>{i % 2 === 1 ? l : ""}</div>
+            <div key={i} style={{ width: 12, height: 13, fontSize: 9, color: T.faint, display: "flex", alignItems: "center", justifyContent: "center" }}>{i % 2 === 1 ? l : ""}</div>
           ))}
         </div>
         {weeks.map((week, wi) => (
           <div key={wi} style={{ display: "flex", flexDirection: "column", gap: 1 }}>
             {Array.from({ length: 7 }, (_, di) => {
               const cell = week[di];
-              if (!cell) return <div key={di} style={{ width: 13, height: 13, borderRadius: 2, backgroundColor: "#ede8e0" }} />;
+              if (!cell) return <div key={di} style={{ width: 13, height: 13, borderRadius: 2, backgroundColor: T.paper }} />;
               return (
                 <div key={di} title={`${fmtDate(cell.date)}: ${cell.value}`}
                   style={{ width: 13, height: 13, borderRadius: 2, backgroundColor: colors[cell.quality], opacity: 0.85, cursor: "default" }} />
@@ -1503,6 +2000,7 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
 }
 
 function SparkLine({ data, baseline }) {
+  const T = useContext(ThemeContext);
   const canvasRef = useRef(null);
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1519,7 +2017,7 @@ function SparkLine({ data, baseline }) {
     const range = max - min || 1;
     ctx.clearRect(0, 0, w, h);
     const by = h - 20 - ((baseline - min) / range) * (h - 40);
-    ctx.strokeStyle = "#c8bfb0";
+    ctx.strokeStyle = T.hair;
     ctx.setLineDash([4, 4]);
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -1527,10 +2025,10 @@ function SparkLine({ data, baseline }) {
     ctx.lineTo(w - 10, by);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "#a09888";
+    ctx.fillStyle = T.faint;
     ctx.font = "10px 'DM Sans', sans-serif";
     ctx.fillText(`${baseline}`, 4, by + 3);
-    ctx.strokeStyle = "#5a6a5a";
+    ctx.strokeStyle = T.calm;
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
     ctx.beginPath();
@@ -1543,80 +2041,221 @@ function SparkLine({ data, baseline }) {
     for (let i = 0; i < values.length; i++) {
       const x = 30 + (i / (values.length - 1)) * (w - 40);
       const y = h - 20 - ((values[i] - min) / range) * (h - 40);
-      ctx.fillStyle = values[i] > baseline + 2 ? "#c45a3a" : "#5a8a64";
+      ctx.fillStyle = values[i] > baseline + 2 ? T.warm : T.calm;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
     }
-  }, [data, baseline]);
+  }, [data, baseline, T]);
   return <canvas ref={canvasRef} style={{ width: "100%", height: 140, display: "block" }} />;
+}
+
+function buildHourlySeries(readings) {
+  const buckets = {};
+  for (const r of readings || []) {
+    const key = `${String(r.hour).padStart(2, "0")}:00`;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(r.bpm);
+  }
+  return Object.entries(buckets)
+    .map(([hour, values]) => ({ hour, bpm: Math.round(meanArr(values)) }))
+    .sort((a, b) => a.hour.localeCompare(b.hour));
+}
+
+function DayDetailModal({ day, baseline, readings, onClose, theme }) {
+  if (!day) return null;
+  const series = buildHourlySeries(readings);
+  const primary = pickPrimaryRecommendation(day.recommendations || []);
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, backgroundColor: "rgba(20,16,12,0.48)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 50 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "min(720px, 100%)", maxHeight: "88vh", overflowY: "auto", backgroundColor: theme.card, border: `1px solid ${theme.hair}`, borderRadius: 12, padding: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600 }}>Day detail</div>
+            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.1, margin: "6px 0 4px" }}>{new Date(day.date).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })}</h2>
+            <div style={{ fontSize: 13, color: theme.soft }}>{confidenceLabel(day.confidence)} · Night coverage {day.coverageNight}%</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: `1px solid ${theme.hair}`, color: theme.soft, borderRadius: 6, padding: "6px 12px", cursor: "pointer" }}>Close</button>
+        </div>
+
+        {primary && (
+          <div style={{ marginBottom: 16, padding: "14px 16px", backgroundColor: "#f4f7f2", borderLeft: `3px solid ${theme.calm}`, borderRadius: 8 }}>
+            <div style={{ fontSize: 11, color: theme.calm, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 6 }}>{primary.severity} priority · {primary.confidence} confidence</div>
+            <div style={{ fontSize: 18, color: theme.ink, marginBottom: 4 }}>{primary.title}</div>
+            <div style={{ fontSize: 14, color: theme.soft, lineHeight: 1.6 }}>{primary.why}</div>
+          </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10, marginBottom: 16 }}>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Baseline</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{baseline.restingHR}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night mean</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.nightMeanHR ?? "—"}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night range</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.rawMetrics?.nightMinHR ?? "—"}–{day.rawMetrics?.nightMaxHR ?? "—"}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Coverage</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.coverageTotal}%</div></div>
+        </div>
+
+        <div style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Hourly HR</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(56px, 1fr))", gap: 6 }}>
+            {series.map(point => {
+              const hourNum = parseInt(point.hour, 10);
+              const nightHour = hourNum >= NIGHT_START && hourNum <= NIGHT_END;
+              return (
+                <div key={point.hour} style={{ padding: "8px 6px", borderRadius: 8, backgroundColor: nightHour ? "#f7efe7" : theme.paper, border: `1px solid ${nightHour ? "#ead7c0" : theme.hair}`, textAlign: "center" }}>
+                  <div style={{ fontSize: 11, color: theme.faint }}>{point.hour}</div>
+                  <div style={{ fontSize: 17, fontFamily: "'Instrument Serif', serif", color: point.bpm > baseline.restingHR ? theme.warm : theme.ink }}>{point.bpm}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {day.drivers && day.drivers.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Drivers</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {day.drivers.map((driver, i) => (
+                <span key={`${driver}-${i}`} style={{ padding: "6px 10px", borderRadius: 999, backgroundColor: theme.paper, border: `1px solid ${theme.hair}`, fontSize: 12, color: theme.soft }}>{driver.replaceAll("_", " ")}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {primary && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Evidence</div>
+              {primary.evidence.map((item, i) => (
+                <div key={i} style={{ fontSize: 13, color: theme.soft, lineHeight: 1.6, marginBottom: 6 }}>{item}</div>
+              ))}
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Actions</div>
+              {primary.actions.map((item, i) => (
+                <div key={i} style={{ fontSize: 13, color: theme.soft, lineHeight: 1.6, marginBottom: 6 }}>{item}</div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 
 // ─── Main App ──────────────────────────────────────────────────────────────
 
 function HRCoach() {
-  const [rawInput, setRawInput] = useState("");
-  const [result, setResult] = useState(null);
-  const [selectedMonth, setSelectedMonth] = useState(null);
-  const [currentView, setCurrentView] = useState("import");
+  const [rawInput, setRawInput] = useState(() => readStorage(STORAGE_KEYS.raw, ""));
+  const [result, setResult] = useState(() => safeJsonParse(readStorage(STORAGE_KEYS.analysis), null));
+  const [selectedMonth, setSelectedMonth] = useState(() => readStorage(STORAGE_KEYS.month, null));
+  const [currentView, setCurrentView] = useState(() => readStorage(STORAGE_KEYS.view, readStorage(STORAGE_KEYS.analysis) ? "overview" : "import"));
   const [copied, setCopied] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [age, setAge] = useState("");
+  const [age, setAge] = useState(() => readStorage(STORAGE_KEYS.age, ""));
   const [importPreview, setImportPreview] = useState(null);
   const [pendingText, setPendingText] = useState("");
   const [importError, setImportError] = useState("");
+  const [fileName, setFileName] = useState(() => readStorage(STORAGE_KEYS.fileName, ""));
+  const [dragActive, setDragActive] = useState(false);
+  const [persistWarning, setPersistWarning] = useState("");
+  const [themeName, setThemeName] = useState(() => readStorage(STORAGE_KEYS.theme, "cream"));
+  const [accentWarm, setAccentWarm] = useState(() => readStorage(STORAGE_KEYS.accentWarm, THEMES.cream.warm));
+  const [selectedDay, setSelectedDay] = useState(null);
+
+  const activeTheme = { ...(THEMES[themeName] || THEMES.cream), warm: accentWarm || (THEMES[themeName] || THEMES.cream).warm };
+  const S = getStyles(activeTheme);
+
+  useEffect(() => { document.body.style.background = activeTheme.appBg; }, [activeTheme]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.theme, themeName); }, [themeName]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.accentWarm, accentWarm); }, [accentWarm]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.view, currentView); }, [currentView]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.month, selectedMonth); }, [selectedMonth]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.age, age); }, [age]);
+  useEffect(() => { if (result) writeStorage(STORAGE_KEYS.analysis, JSON.stringify(result)); }, [result]);
+  useEffect(() => { writeStorage(STORAGE_KEYS.fileName, fileName); }, [fileName]);
+  useEffect(() => {
+    if (result && !selectedMonth && result.monthKeys && result.monthKeys.length > 0) {
+      setSelectedMonth(result.monthKeys[result.monthKeys.length - 1]);
+    }
+  }, [result, selectedMonth]);
+  useEffect(() => {
+    if (!result && currentView !== "import") setCurrentView("import");
+  }, [result, currentView]);
+
+  const doPreview = useCallback((text, name = "") => {
+    setImportError("");
+    setRawInput(text);
+    setPendingText(text);
+    setFileName(name);
+    setImportPreview(previewZeppData(text));
+  }, []);
+
+  const resetAnalysis = useCallback(() => {
+    setResult(null);
+    setSelectedMonth(null);
+    setCurrentView("import");
+    setImportPreview(null);
+    setPendingText("");
+    setRawInput("");
+    setFileName("");
+    setPersistWarning("");
+    removeStorageKeys([STORAGE_KEYS.analysis, STORAGE_KEYS.raw, STORAGE_KEYS.month, STORAGE_KEYS.view, STORAGE_KEYS.fileName]);
+  }, []);
 
   const runAnalysis = useCallback((text) => {
     try {
-    const raw = parseZeppData(text);
-    if (raw.length < 100) {
-      alert(`Parsed ${raw.length} valid readings from ${text.length} bytes. Need at least 100.\n\nLine 1: ${text.split("\n")[0].substring(0, 80)}\nLine 2: ${(text.split("\n")[1]||"").substring(0, 80)}\n\nExpected: DD/MM/YYYY, HH:MM, BPM (comma or tab separated).`);
+      const raw = parseZeppData(text);
+      if (raw.length < 100) {
+        alert(`Parsed ${raw.length} valid readings from ${text.length} bytes. Need at least 100.\n\nLine 1: ${text.split("\n")[0].substring(0, 80)}\nLine 2: ${(text.split("\n")[1]||"").substring(0, 80)}\n\nExpected: DD/MM/YYYY, HH:MM, BPM (comma or tab separated).`);
+        setLoading(false);
+        return;
+      }
+      const cleaned = cleanData(raw);
+      const days = groupByDate(cleaned);
+      const baseline = computeBaseline(days);
+      const dataQuality = computeDataQuality(days);
+
+      const allBpms = cleaned.map(r => r.bpm).sort((a, b) => a - b);
+      const p99 = allBpms[Math.floor(allBpms.length * 0.99)] || 175;
+      const ageNum = parseInt(age, 10);
+      const maxHR = (!isNaN(ageNum) && ageNum > 10 && ageNum < 110)
+        ? Math.round(208 - 0.7 * ageNum)
+        : p99;
+
+      const dailySignals = computeDailySignals(days, baseline, maxHR);
+      const patterns = findPatterns(dailySignals, baseline);
+      const recovery = detectWorkoutRecovery(dailySignals, baseline);
+
+      const months = {};
+      for (const d of dailySignals) {
+        const mk = getMonthKey(d.date);
+        if (!months[mk]) months[mk] = [];
+        months[mk].push(d);
+      }
+      const monthKeys = Object.keys(months).sort();
+      const monthReports = {};
+      for (const mk of monthKeys) {
+        const summary = summarizeRange(months[mk], baseline);
+        monthReports[mk] = { avgRecovery: summary.avgRecovery, avgStress: summary.avgStress, avgLoad: summary.avgLoad, avgEfficiency: summary.avgEfficiency };
+      }
+      for (const mk of monthKeys) {
+        monthReports[mk] = generateMonthCoachNotes(months[mk], baseline, dailySignals, monthReports, mk);
+      }
+
+      const exportText = generateExportSummary(baseline, dailySignals, patterns, recovery, dataQuality);
+      const analysis = { baseline, dataQuality, dailySignals, patterns, recovery, months, monthKeys, monthReports, exportText, maxHR, rawReadingsByDate: days };
+
+      setResult(analysis);
+      if (text.length <= RAW_PERSIST_LIMIT) {
+        writeStorage(STORAGE_KEYS.raw, text);
+        setPersistWarning("");
+      } else {
+        writeStorage(STORAGE_KEYS.raw, "");
+        setPersistWarning("Dataset is larger than 5 MB, so the raw file was not saved for refresh recovery. The analysis summary was saved.");
+      }
+      setSelectedMonth(monthKeys[monthKeys.length - 1] || null);
+      setCurrentView("overview");
       setLoading(false);
-      return;
-    }
-    const cleaned = cleanData(raw);
-    const days = groupByDate(cleaned);
-    const baseline = computeBaseline(days);
-    const dataQuality = computeDataQuality(days);
-
-    // Phase 1: maxHR from age (Tanaka formula) or 99th-percentile of observed data
-    const allBpms = cleaned.map(r => r.bpm).sort((a, b) => a - b);
-    const p99 = allBpms[Math.floor(allBpms.length * 0.99)] || 175;
-    const ageNum = parseInt(age, 10);
-    const maxHR = (!isNaN(ageNum) && ageNum > 10 && ageNum < 110)
-      ? Math.round(208 - 0.7 * ageNum)  // Tanaka formula (more accurate than 220-age)
-      : p99;
-
-    const dailySignals = computeDailySignals(days, baseline, maxHR);
-    const patterns = findPatterns(dailySignals, baseline);
-    const recovery = detectWorkoutRecovery(dailySignals, baseline);
-
-    const months = {};
-    for (const d of dailySignals) {
-      const mk = getMonthKey(d.date);
-      if (!months[mk]) months[mk] = [];
-      months[mk].push(d);
-    }
-    const monthKeys = Object.keys(months).sort();
-    // Two-pass: first get basic averages, then generate full reports with cross-month context
-    const monthReports = {};
-    // Pass 1: basic averages for month-over-month comparison
-    for (const mk of monthKeys) {
-      const v = months[mk].filter(d => !d.incomplete);
-      monthReports[mk] = { avgRecovery: meanArr(v.map(d => d.recoveryQuality)), avgStress: meanArr(v.map(d => d.stressSignature)) };
-    }
-    // Pass 2: full reports with cross-month context
-    for (const mk of monthKeys) {
-      monthReports[mk] = generateMonthCoachNotes(months[mk], baseline, dailySignals, monthReports, mk);
-    }
-
-    const exportText = generateExportSummary(baseline, dailySignals, patterns, recovery, dataQuality);
-
-    setResult({ baseline, dataQuality, dailySignals, patterns, recovery, months, monthKeys, monthReports, exportText, maxHR });
-    setSelectedMonth(monthKeys[monthKeys.length - 1]);
-    setCurrentView("overview");
-    setLoading(false);
     } catch(e) {
       console.error("runAnalysis error:", e);
       alert("Analysis error: " + e.message + "\n\nStack: " + e.stack);
@@ -1624,17 +2263,14 @@ function HRCoach() {
     }
   }, [age]);
 
-  const handleFile = useCallback((e) => {
-    const file = e.target.files[0];
+  const handleFile = useCallback((file) => {
     if (!file) return;
-    setLoading(true);
     const reader = new FileReader();
     reader.onload = (ev) => {
-      setRawInput(ev.target.result);
-      setTimeout(() => runAnalysis(ev.target.result), 50);
+      doPreview(ev.target.result, file.name);
     };
     reader.readAsText(file);
-  }, [runAnalysis]);
+  }, [doPreview]);
 
   const handleCopySummary = useCallback(() => {
     if (!result) return;
@@ -1649,6 +2285,7 @@ function HRCoach() {
 
   if (currentView === "import") {
     return (
+      <ThemeContext.Provider value={activeTheme}>
       <div style={S.shell}>
         <div style={S.importWrap}>
           <div style={S.importInner}>
@@ -1676,12 +2313,12 @@ function HRCoach() {
                   <div style={{ padding: "16px 14px", borderRadius: 10, backgroundColor: "#f4f7f2", border: "1px solid #c8d8c4", marginBottom: 18 }}>
                     <div style={{ fontSize: 11, color: "#5a7a5a", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Import summary</div>
                     <div style={{ fontSize: 13, color: "#3a5a3a", lineHeight: 1.6 }}>
-                      <div>Parsed {importPreview.parsed} readings (skipped {importPreview.skipped}).</div>
-                      <div>Delimiter: {importPreview.sep === "\t" ? "tab" : importPreview.sep === "," ? "comma" : "semicolon"}{importPreview.dateFormat ? ` · Date: ${importPreview.dateFormat}` : ""}{importPreview.medianInterval ? ` · Median interval: ${importPreview.medianInterval} min` : ""}</div>
+                      <div>{importPreview.parsed.toLocaleString("en-GB")} readings parsed · {importPreview.skipped.toLocaleString("en-GB")} skipped</div>
                       {importPreview.start && importPreview.end && (
-                        <div>Range: {importPreview.start.toLocaleDateString("en-GB")} → {importPreview.end.toLocaleDateString("en-GB")} ({importPreview.totalDays} days)</div>
+                        <div>{importPreview.start.toLocaleDateString("en-CA")} → {importPreview.end.toLocaleDateString("en-CA")}</div>
                       )}
-                      <div>Coverage (est.): avg {importPreview.avgCoverage}%, min {importPreview.minCoverage}%, max {importPreview.maxCoverage}%</div>
+                      <div>Delimiter: {getSepLabel(importPreview.sep)}{importPreview.dateFormat ? ` · Date: ${importPreview.dateFormat}` : ""}{importPreview.medianInterval ? ` · Median interval: ${importPreview.medianInterval} min` : ""}</div>
+                      <div>Average night coverage: {importPreview.avgNightCoverage}%</div>
                     </div>
                     <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
                       <button style={{ ...S.btnPrimary, padding: "10px 18px" }} onClick={() => { setImportError(""); setLoading(true); setTimeout(() => runAnalysis(pendingText || rawInput), 50); }}>Run analysis</button>
@@ -1690,24 +2327,35 @@ function HRCoach() {
                     <div style={{ marginTop: 10, fontSize: 12, color: "#6a8a6a" }}>Nothing is uploaded. Analysis runs only on this device.</div>
                   </div>
                 )}
-                {/* Primary: File upload — works in real browsers */}
-                <div style={{
-                  padding: "28px 20px", borderRadius: 10, border: "2px dashed #c8c0b4",
-                  backgroundColor: "#fff", textAlign: "center", marginBottom: 24, position: "relative",
-                }}>
-                  <div style={{ fontSize: 28, marginBottom: 8 }}>📂</div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: "#2a2520", marginBottom: 4 }}>Tap to select your Zepp export</div>
-                  <div style={{ fontSize: 13, color: "#8a8070", marginBottom: 16 }}>.txt, .csv, or .tsv file</div>
+                <label
+                  onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+                  onDragLeave={() => setDragActive(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDragActive(false);
+                    handleFile(e.dataTransfer.files[0]);
+                  }}
+                  style={{
+                    display: "block",
+                    border: `2px dashed ${dragActive ? activeTheme.warm : activeTheme.hair}`,
+                    borderRadius: 10,
+                    padding: "24px 16px",
+                    textAlign: "center",
+                    cursor: "pointer",
+                    backgroundColor: dragActive ? activeTheme.card : activeTheme.paper,
+                    marginBottom: 24,
+                  }}
+                >
                   <input
                     type="file"
                     accept=".txt,.csv,.tsv,text/plain,text/csv,text/tab-separated-values"
-                    onChange={handleFile}
-                    style={{
-                      position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
-                      opacity: 0, cursor: "pointer", fontSize: 0,
-                    }}
+                    onChange={(e) => handleFile(e.target.files[0])}
+                    style={{ display: "none" }}
                   />
-                </div>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>📂</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: activeTheme.ink, marginBottom: 4 }}>Drop a .csv / .txt file or click to browse</div>
+                  <div style={{ fontSize: 13, color: activeTheme.soft }}>{fileName ? `Loaded: ${fileName}` : ".txt, .csv, or .tsv file"}</div>
+                </label>
 
                 {/* Fallback: Paste */}
                 <details style={{ marginBottom: 16 }}>
@@ -1720,13 +2368,14 @@ function HRCoach() {
                     spellCheck={false}
                   />
                   {rawInput.length > 0 && (
-                    <button style={{ ...S.btnPrimary, marginTop: 10, width: "100%" }} onClick={() => { setImportError(""); const pv = previewZeppData(rawInput); setImportPreview(pv); setPendingText(rawInput); }}>
+                    <button style={{ ...S.btnPrimary, marginTop: 10, width: "100%" }} onClick={() => doPreview(rawInput, fileName)}>
                       Analyse ({(rawInput.length / 1024).toFixed(0)} KB)
                     </button>
                   )}
                 </details>
 
                 <div style={S.fmtNote}>Expected format: <code style={S.code}>DD/MM/YYYY	HH:MM	BPM</code> — one reading per line.</div>
+                {persistWarning && <div style={{ marginTop: 10, fontSize: 12, color: activeTheme.warm }}>{persistWarning}</div>}
 
                 <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12 }}>
                   <label style={{ fontSize: 13, color: "#6a6055", flexShrink: 0 }}>Your age <span style={{ color: "#a09888" }}>(for activity zones)</span></label>
@@ -1742,16 +2391,21 @@ function HRCoach() {
                     </span>
                   )}
                 </div>
+                <div style={{ marginTop: 18, fontSize: 12, color: activeTheme.faint, lineHeight: 1.5 }}>
+                  Heart Rate Coach is for personal wellness trend tracking only — not a medical device.
+                  Your data stays in your browser and is never uploaded.
+                </div>
               </>
             )}
           </div>
         </div>
       </div>
+      </ThemeContext.Provider>
     );
   }
 
   if (!result) return null;
-  const { baseline, dailySignals, patterns, recovery, monthKeys, monthReports, months, dataQuality, maxHR } = result;
+  const { baseline, dailySignals, patterns, recovery, monthKeys, monthReports, months, dataQuality, maxHR, rawReadingsByDate = {} } = result;
   const validDays = dailySignals.filter(d => !d.incomplete);
   const dateRange = `${fmtDate(dailySignals[0].date)} – ${fmtDate(dailySignals[dailySignals.length - 1].date)}`;
   const lastValid = validDays[validDays.length - 1];
@@ -1759,10 +2413,14 @@ function HRCoach() {
   // ─── OVERVIEW SCREEN ────────────────────────────────────────────────────
 
   if (currentView === "overview") {
-    const overallRecovery = meanArr(validDays.map(d => d.recoveryQuality));
-    const overallStress = meanArr(validDays.map(d => d.stressSignature));
+    const overallSummary = summarizeRange(validDays, baseline);
+    const overallRecovery = overallSummary.avgRecovery;
+    const overallStress = overallSummary.avgStress;
+    const overallRecommendations = generateRangeRecommendations(validDays, baseline);
+    const overallPrimary = pickPrimaryRecommendation(overallRecommendations);
 
     return (
+      <ThemeContext.Provider value={activeTheme}>
       <div style={S.shell}>
         <div style={S.report}>
           <div style={S.header}>
@@ -1774,7 +2432,7 @@ function HRCoach() {
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button style={S.btnGhost} onClick={handleCopySummary}>{copied ? "✓ Copied" : "Copy summary"}</button>
-                <button style={S.btnGhost} onClick={() => setCurrentView("import")}>← New data</button>
+                <button style={S.btnGhost} onClick={resetAnalysis}>← New data</button>
               </div>
             </div>
           </div>
@@ -1833,7 +2491,10 @@ function HRCoach() {
             </div>
             <FullGridHeatmap signals={validDays} field="recoveryQuality" label="Recovery Quality" isInverse={false} />
             <FullGridHeatmap signals={validDays} field="autonomicLoad" label="Autonomic Load" isInverse={true} />
-            <FullGridHeatmap signals={validDays} field="ansStability" label="ANS Stability (overnight rhythm)" isInverse={false} />
+            <FullGridHeatmap signals={validDays} field="pulseStability" label="Pulse Stability (overnight rhythm)" isInverse={false} />
+            <div style={{ fontSize: 12, color: activeTheme.faint, marginTop: -4, marginBottom: 10 }}>
+              Based on HR reading variation, not inter-beat HRV. Use as a trend indicator only.
+            </div>
             <FullGridHeatmap signals={validDays} field="cardioEfficiency" label="Cardiovascular Efficiency" isInverse={false} />
             <FullGridHeatmap signals={validDays} field="stressSignature" label="Stress Signature" isInverse={true} />
             <FullGridHeatmap signals={validDays} field="recoveryDebt" label="Recovery Debt" isInverse={true} />
@@ -1911,7 +2572,8 @@ function HRCoach() {
                 if (avgEff < 40) parts.push(`Cardiovascular efficiency is on the low side (${Math.round(avgEff)}%). Your heart is working harder than it needs to during the day — hydration, caffeine timing, and regular low-intensity movement are the first things to check.`);
 
                 // Top recommendation
-                if (overallRecovery < 50) parts.push("Top priority: focus on sleep consistency. Go to bed within a 30-minute window every night for two weeks and watch whether your overnight HR responds.");
+                if (overallPrimary) parts.push(`Top priority: ${overallPrimary.why}`);
+                else if (overallRecovery < 50) parts.push("Top priority: focus on sleep consistency. Go to bed within a 30-minute window every night for two weeks and watch whether your overnight HR responds.");
                 else if (overallStress > 55) parts.push("Top priority: build an evening wind-down. Dim lights, no work email, light activity — give your nervous system a clear signal the day is ending.");
                 else if (avgDebt > 45) parts.push("Top priority: make sure you have at least one genuine low-load day per week. Not active recovery — actual rest.");
                 else parts.push("Your data looks healthy. The main opportunity is consistency — protect the habits that are working and look for small optimisations rather than big changes.");
@@ -1922,6 +2584,7 @@ function HRCoach() {
           </div>
         </div>
       </div>
+      </ThemeContext.Provider>
     );
   }
 
@@ -1932,14 +2595,17 @@ function HRCoach() {
     const report = monthReports[selectedMonth];
     const valid = monthData.filter(d => !d.incomplete);
     const nightTrend = valid.filter(d => d.nightMeanHR !== null).map(d => ({ date: d.date, hr: d.nightMeanHR }));
+    const lowConfidenceDays = valid.filter(d => d.confidence === "low").length;
+    const selectedDayRecord = selectedDay ? valid.find(d => d.date === selectedDay) : null;
 
     return (
+      <ThemeContext.Provider value={activeTheme}>
       <div style={S.shell}>
         <div style={S.report}>
           <div style={S.header}>
             <button style={S.btnGhost} onClick={() => setCurrentView("overview")}>← Overview</button>
             <h1 style={S.title}>{fmtMonth(selectedMonth)}</h1>
-            <div style={S.meta}>{valid.length} days of data</div>
+            <div style={S.meta}>{valid.length} days of data · Data quality: {report.dataQualitySummary?.label || "n/a"} ({report.dataQualitySummary?.sufficientNightPct ?? 0}% sufficient nights)</div>
           </div>
 
           <div style={S.card}>
@@ -1960,12 +2626,12 @@ function HRCoach() {
               late_nadir: "Late HR nadir",
               flat_evening: "Flat evening wind-down",
               high_night_volatility: "Chaotic overnight rhythm",
-              low_ans_stability: "Low ANS stability",
+              low_pulse_stability: "Low pulse stability",
               high_wake_spike: "High wake-up spike",
               high_idle_stress: "High idle stress",
               good_nadir: "Optimal nadir timing",
               good_evening_drop: "Strong evening wind-down",
-              strong_ans_stability: "Stable overnight rhythm",
+              stable_pulse: "Stable overnight rhythm",
               smooth_wake: "Smooth wake response",
               calm_day: "Calm daytime HR",
             })[labelMap] || labelMap;
@@ -2053,8 +2719,17 @@ function HRCoach() {
             {/* Priority recommendation */}
           {report.priority && (
             <div style={{ ...S.card, backgroundColor: "#f4f7f2", borderColor: "#c8d8c4" }}>
-              <div style={{ ...S.cardLabel, color: "#5a7a5a" }}>This month's priority: {report.priority.label}</div>
+              <div style={{ ...S.cardLabel, color: "#5a7a5a" }}>This month's priority: {report.priority.label}{report.priority.confidence ? ` · ${report.priority.confidence} confidence` : ""}</div>
               <p style={{ ...S.coachText, color: "#3a5a3a" }}>{report.priority.text}</p>
+            </div>
+          )}
+
+          {report.primaryRecommendation && (
+            <div style={S.card}>
+              <div style={S.cardLabel}>Why this is showing up</div>
+              {report.primaryRecommendation.evidence.map((item, i) => (
+                <div key={i} style={{ fontSize: 13, color: activeTheme.soft, lineHeight: 1.6, marginBottom: 6 }}>{item}</div>
+              ))}
             </div>
           )}
 
@@ -2065,11 +2740,20 @@ function HRCoach() {
             <GridHeatmap signals={valid} field="recoveryDebt" label="Recovery Debt" isInverse={true} />
             <GridHeatmap signals={valid} field="cardioEfficiency" label="Cardiovascular Efficiency" isInverse={false} />
             <GridHeatmap signals={valid} field="autonomicLoad" label="Autonomic Load" isInverse={true} />
-            <GridHeatmap signals={valid} field="ansStability" label="ANS Stability (overnight rhythm)" isInverse={false} />
+            <GridHeatmap signals={valid} field="pulseStability" label="Pulse Stability (overnight rhythm)" isInverse={false} />
+            <div style={{ fontSize: 12, color: activeTheme.faint, marginTop: -4 }}>
+              Based on HR reading variation, not inter-beat HRV. Use as a trend indicator only.
+            </div>
             {valid.some(d => d.acwr !== null) && (
               <GridHeatmap signals={valid.map(d => ({ ...d, acwrDisplay: d.acwr !== null ? Math.round(d.acwr * 100) : null }))} field="acwrDisplay" label="Workload Ratio (ACWR ×100)" isInverse={false} />
             )}
           </div>
+          {valid.length > 0 && lowConfidenceDays / valid.length > 0.3 && (
+            <div style={{ ...S.card, backgroundColor: activeTheme.paper }}>
+              <div style={S.cardLabel}>Confidence note</div>
+              <p style={S.cardSub}>{lowConfidenceDays} of {valid.length} days this month had low night-data confidence. Treat month-level conclusions as directional.</p>
+            </div>
+          )}
 
           {report.notes.length > 0 && (
             <div style={S.card}>
@@ -2119,10 +2803,18 @@ function HRCoach() {
           {nightTrend.length > 5 && (
             <div style={S.card}>
               <div style={S.cardLabel}>Overnight HR through the month</div>
-              <p style={S.cardSub}>Average HR between 1–5am. Dashed line = your baseline ({baseline.restingHR} bpm).</p>
+              <p style={S.cardSub}>Average HR during {NIGHT_LABEL}. Dashed line = your baseline ({baseline.restingHR} bpm).</p>
               <SparkLine data={nightTrend} baseline={baseline.restingHR} />
             </div>
           )}
+          <details style={S.card}>
+            <summary style={{ cursor: "pointer", color: activeTheme.soft, fontSize: 13 }}>How scores are calculated</summary>
+            <div style={{ marginTop: 12, fontSize: 13, color: activeTheme.soft, lineHeight: 1.6 }}>
+              <div>Recovery combines your night HR vs your personal baseline and night HR stability.</div>
+              <div>Stress reflects how elevated your night HR is relative to baseline.</div>
+              <div>These are experimental trend indicators, not clinical measurements.</div>
+            </div>
+          </details>
 
           <div style={S.card}>
             <div style={S.cardLabel}>Daily log</div>
@@ -2137,7 +2829,7 @@ function HRCoach() {
                 const actLabel = d.activityLevel === "workout" ? "workout" : d.activityLevel === "moderate" ? "moderate" : d.activityLevel === "light" ? "light" : "";
                 const actColor = d.activityLevel === "workout" ? "#7a5aaa" : d.activityLevel === "moderate" ? "#5a7aaa" : d.activityLevel === "light" ? "#7a9a8a" : "#a09888";
                 return (
-                  <div key={i} style={S.dayRow}>
+                  <div key={i} style={{ ...S.dayRow, cursor: "pointer" }} onClick={() => setSelectedDay(d.date)}>
                     <span style={{ color: "#4a4540" }}>{dayLabel}</span>
                     <span style={{ color: "#6a6055", textAlign: "center" }}>{d.dayMeanHR}</span>
                     <span style={{ fontSize: 14, textAlign: "center", color: recColor }}>●</span>
@@ -2151,9 +2843,9 @@ function HRCoach() {
         if (drv.includes("high_wake_spike")) driverTags.push("⚡ wake spike");
         if (drv.includes("high_idle_stress")) driverTags.push("🔥 idle stress");
         if (drv.includes("flat_evening")) driverTags.push("↔ evening");
-        if (drv.includes("high_night_volatility") || drv.includes("low_ans_stability")) driverTags.push("~ ANS");
+        if (drv.includes("high_night_volatility") || drv.includes("low_pulse_stability")) driverTags.push("~ Pulse");
         if (drv.includes("good_nadir")) driverTags.push("✦ good nadir");
-        const base = [actLabel, d.activeMinutes > 0 && actLabel && `${d.activeMinutes}m`, d.trimp > 0 && `TRIMP ${d.trimp}`, d.acwr !== null && (d.acwr > 1.5 ? `⚠ ACWR ${d.acwr}` : d.acwr < 0.8 ? `↓ ACWR ${d.acwr}` : null), d.coverage < 80 && `${d.coverage}%`, ...driverTags];
+        const base = [actLabel, d.activeMinutes > 0 && actLabel && `${d.activeMinutes}m`, d.trimp > 0 && `TRIMP ${d.trimp}`, d.acwr !== null && (d.acwr > 1.5 ? `⚠ ACWR ${d.acwr}` : d.acwr < 0.8 ? `↓ ACWR ${d.acwr}` : null), d.coverage < 80 && `${d.coverage}%`, d.coverageNight < 50 && `${d.coverageNight}% night`, d.confidence !== "high" && `⚠ ${confidenceLabel(d.confidence)}`, ...driverTags];
         return base.filter(Boolean).join(" · ");
       })()}
                     </span>
@@ -2172,7 +2864,15 @@ function HRCoach() {
             ))}
           </div>
         </div>
+        <DayDetailModal
+          day={selectedDayRecord}
+          baseline={baseline}
+          readings={selectedDayRecord ? rawReadingsByDate[selectedDayRecord.date] || [] : []}
+          onClose={() => setSelectedDay(null)}
+          theme={activeTheme}
+        />
       </div>
+      </ThemeContext.Provider>
     );
   }
 
@@ -2182,42 +2882,44 @@ function HRCoach() {
 
 // ─── Styles ────────────────────────────────────────────────────────────────
 
-const S = {
-  shell: { minHeight: "100vh", backgroundColor: "#f9f6f0", fontFamily: "'DM Sans', sans-serif", color: "#2a2520", lineHeight: 1.6, overflowX: "hidden" },
-  importWrap: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", padding: "24px 16px" },
-  importInner: { maxWidth: 600, width: "100%" },
-  eyebrow: { fontSize: 12, color: "#a09888", letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 500, marginBottom: 4 },
-  importTitle: { fontFamily: "'Instrument Serif', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.15, margin: "0 0 14px", color: "#1a1510" },
-  importSub: { fontSize: 15, color: "#6a6055", marginBottom: 24, maxWidth: 520 },
-  textarea: { width: "100%", minHeight: 180, padding: 16, fontSize: 13, fontFamily: "'DM Mono', 'SF Mono', monospace", backgroundColor: "#fff", border: "1px solid #d8d0c4", borderRadius: 8, resize: "vertical", color: "#2a2520", outline: "none", boxSizing: "border-box" },
-  btnPrimary: { padding: "12px 28px", fontSize: 14, fontWeight: 600, backgroundColor: "#2a2520", color: "#f5f0e8", border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Sans', sans-serif" },
-  btnGhost: { background: "none", border: "1px solid #d0c8b8", color: "#6a6055", cursor: "pointer", fontSize: 13, fontFamily: "'DM Sans', sans-serif", padding: "6px 14px", borderRadius: 5 },
-  fmtNote: { marginTop: 20, fontSize: 12, color: "#a09888" },
-  code: { backgroundColor: "#ede8e0", padding: "2px 6px", borderRadius: 3, fontSize: 11, fontFamily: "'DM Mono', 'SF Mono', monospace" },
-  report: { maxWidth: 720, margin: "0 auto", padding: "24px 12px 60px" },
-  header: { marginBottom: 32 },
-  title: { fontFamily: "'Instrument Serif', serif", fontSize: 26, fontWeight: 400, lineHeight: 1.15, margin: "8px 0 4px", color: "#1a1510" },
-  meta: { fontSize: 13, color: "#8a8070" },
-  card: { backgroundColor: "#fff", borderRadius: 10, padding: "20px 16px", marginBottom: 16, border: "1px solid #e8e2d8" },
-  cardLabel: { fontSize: 11, color: "#a09888", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 },
-  cardSub: { fontSize: 13, color: "#8a8070", marginTop: 0, marginBottom: 16 },
-  baseGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 20, marginBottom: 16 },
-  baseStat: { textAlign: "center" },
-  bigNum: { fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: "#1a1510", lineHeight: 1 },
-  statLabel: { fontSize: 12, color: "#8a8070", marginTop: 4 },
-  baseNote: { fontSize: 13, color: "#8a8070", fontStyle: "italic", marginBottom: 0, marginTop: 8 },
-  insight: { borderLeft: "3px solid #ccc", paddingLeft: 16, marginBottom: 20, marginTop: 16 },
-  insightTitle: { fontSize: 16, fontWeight: 600, color: "#1a1510", marginBottom: 4, fontFamily: "'Instrument Serif', serif" },
-  insightBody: { fontSize: 14, color: "#4a4540", lineHeight: 1.65 },
-  coachText: { fontSize: 15, color: "#3a3530", lineHeight: 1.7, margin: "8px 0 0" },
-  coachNote: { display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 16, marginTop: 12 },
-  coachIcon: { fontSize: 16, color: "#8a7a60", flexShrink: 0, marginTop: 2 },
-  coachNoteText: { fontSize: 14, color: "#4a4540", lineHeight: 1.65 },
-  monthBtn: { padding: "8px 16px", fontSize: 13, fontWeight: 500, borderRadius: 6, cursor: "pointer", border: "1px solid #d0c8b8", fontFamily: "'DM Sans', sans-serif", backgroundColor: "#f5f0e8", color: "#3a3228", transition: "all 0.15s ease" },
-  dayGrid: { fontSize: 13, marginTop: 12 },
-  dayGridH: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, fontWeight: 600, color: "#a09888", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: "1px solid #e8e2d8", paddingBottom: 8, marginBottom: 4 },
-  dayRow: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, padding: "5px 0", borderBottom: "1px solid #f0ece4", alignItems: "center" },
-};
+function getStyles(T) {
+  return {
+    shell: { minHeight: "100vh", backgroundColor: T.paper, fontFamily: "'DM Sans', sans-serif", color: T.ink, lineHeight: 1.6, overflowX: "hidden" },
+    importWrap: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", padding: "24px 16px" },
+    importInner: { maxWidth: 600, width: "100%" },
+    eyebrow: { fontSize: 12, color: T.faint, letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 500, marginBottom: 4 },
+    importTitle: { fontFamily: "'Instrument Serif', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.15, margin: "0 0 14px", color: T.ink },
+    importSub: { fontSize: 15, color: T.soft, marginBottom: 24, maxWidth: 520 },
+    textarea: { width: "100%", minHeight: 180, padding: 16, fontSize: 13, fontFamily: "'DM Mono', 'SF Mono', monospace", backgroundColor: T.card, border: `1px solid ${T.hair}`, borderRadius: 8, resize: "vertical", color: T.ink, outline: "none", boxSizing: "border-box" },
+    btnPrimary: { padding: "12px 28px", fontSize: 14, fontWeight: 600, backgroundColor: T.ink, color: T.paper, border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Sans', sans-serif" },
+    btnGhost: { background: "none", border: `1px solid ${T.hair}`, color: T.soft, cursor: "pointer", fontSize: 13, fontFamily: "'DM Sans', sans-serif", padding: "6px 14px", borderRadius: 5 },
+    fmtNote: { marginTop: 20, fontSize: 12, color: T.faint },
+    code: { backgroundColor: T.paper, padding: "2px 6px", borderRadius: 3, fontSize: 11, fontFamily: "'DM Mono', 'SF Mono', monospace" },
+    report: { maxWidth: 720, margin: "0 auto", padding: "24px 12px 60px" },
+    header: { marginBottom: 32 },
+    title: { fontFamily: "'Instrument Serif', serif", fontSize: 26, fontWeight: 400, lineHeight: 1.15, margin: "8px 0 4px", color: T.ink },
+    meta: { fontSize: 13, color: T.faint },
+    card: { backgroundColor: T.card, borderRadius: 10, padding: "20px 16px", marginBottom: 16, border: `1px solid ${T.hair}` },
+    cardLabel: { fontSize: 11, color: T.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 },
+    cardSub: { fontSize: 13, color: T.soft, marginTop: 0, marginBottom: 16 },
+    baseGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 20, marginBottom: 16 },
+    baseStat: { textAlign: "center" },
+    bigNum: { fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: T.ink, lineHeight: 1 },
+    statLabel: { fontSize: 12, color: T.faint, marginTop: 4 },
+    baseNote: { fontSize: 13, color: T.soft, fontStyle: "italic", marginBottom: 0, marginTop: 8 },
+    insight: { borderLeft: `3px solid ${T.hair}`, paddingLeft: 16, marginBottom: 20, marginTop: 16 },
+    insightTitle: { fontSize: 16, fontWeight: 600, color: T.ink, marginBottom: 4, fontFamily: "'Instrument Serif', serif" },
+    insightBody: { fontSize: 14, color: T.soft, lineHeight: 1.65 },
+    coachText: { fontSize: 15, color: T.ink, lineHeight: 1.7, margin: "8px 0 0" },
+    coachNote: { display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 16, marginTop: 12 },
+    coachIcon: { fontSize: 16, color: T.soft, flexShrink: 0, marginTop: 2 },
+    coachNoteText: { fontSize: 14, color: T.soft, lineHeight: 1.65 },
+    monthBtn: { padding: "8px 16px", fontSize: 13, fontWeight: 500, borderRadius: 6, cursor: "pointer", border: `1px solid ${T.hair}`, fontFamily: "'DM Sans', sans-serif", backgroundColor: T.paper, color: T.ink, transition: "all 0.15s ease" },
+    dayGrid: { fontSize: 13, marginTop: 12 },
+    dayGridH: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, fontWeight: 600, color: T.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: `1px solid ${T.hair}`, paddingBottom: 8, marginBottom: 4 },
+    dayRow: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, padding: "5px 0", borderBottom: `1px solid ${T.paper}`, alignItems: "center" },
+  };
+}
 
 ReactDOM.createRoot(document.getElementById("root")).render(<HRCoach />);
 </script>
