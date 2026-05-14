@@ -328,7 +328,8 @@ function summarizeConfidence(days) {
   const weightedCoverageNight = Math.round(weightedMean(valid.map(d => d.coverageNight ?? 0), (_, i) => getCoverageWeight(valid[i])));
   const lowConfidenceDays = valid.filter(d => d.confidence === "low").length;
   const label = sufficientNightPct >= 80 ? "Good" : sufficientNightPct >= 60 ? "Fair" : "Weak";
-  return { label, sufficientNightPct, lowConfidenceDays, weightedCoverageNight };
+  const copyMode = sufficientNightPct >= 80 ? "direct" : sufficientNightPct >= 60 ? "qualified" : "directional";
+  return { label, sufficientNightPct, lowConfidenceDays, weightedCoverageNight, copyMode };
 }
 
 function summarizeRange(days, baseline) {
@@ -862,8 +863,38 @@ function attachRollingTrends(days) {
   }
 }
 
-function buildRecommendation(id, severity, confidenceLevel, title, why, evidence, actions) {
-  return { id, severity, confidence: confidenceLevel, title, why, evidence, actions };
+const ACTIONS = {
+  sleep_timing_anchor:    "Keep bedtime and wake time within a 30-minute window for the next three nights.",
+  lighter_late_evening:   "Finish heavy meals 2–3 hours before bed when possible.",
+  alcohol_free_winddown:  "Avoid alcohol close to bedtime on nights where recovery matters.",
+  caffeine_cutoff:        "Try stopping caffeine earlier in the day for one week.",
+  evening_decompression:  "Dim lights and reduce work/screens during the final hour before bed.",
+  training_deload:        "Reduce intensity for the next two to three days.",
+  rest_day_protection:    "Schedule at least one full rest day this week — not active recovery, actual rest.",
+  low_intensity_movement: "Add a short easy walk after dinner to support the evening HR wind-down.",
+  hydration_on_waking:    "Drink 250–500 ml of water immediately on waking.",
+  training_spacing:       "Add at least one lighter day between hard sessions.",
+  use_surrounding_trend:  "Use the surrounding days for context rather than this day in isolation.",
+  data_quality_note:      "Wear your device overnight for more reliable trend reading.",
+};
+
+function buildRecommendation(id, severity, confidenceLevel, title, observation, interpretation, evidence, actionIds) {
+  return { id, severity, confidence: confidenceLevel, title, why: observation, observation, interpretation, evidence, actionIds, actions: actionIds.map(k => ACTIONS[k] || k) };
+}
+
+function buildFallbackPriority(avgRecovery, avgStress, avgDebt, avgEfficiency, copyMode) {
+  if (copyMode === "directional") {
+    if (avgRecovery < 45) return { label: "Sleep & recovery",  text: "Night coverage is limited, but recovery looks under pressure. Sleep consistency — a steady bedtime window — is a low-risk first step." };
+    if (avgStress > 60)   return { label: "Stress management", text: "Stress looks elevated, though data quality limits certainty. A calmer evening routine is worth testing regardless." };
+    if (avgDebt > 50)     return { label: "Load management",   text: "Recovery debt may be accumulating. If training has been heavy, scheduling a genuine rest day is a good bet." };
+    return null;
+  }
+  const q = copyMode === "qualified";
+  if (avgRecovery < 45) return { label: "Sleep & recovery",  text: q ? "Recovery looks under pressure most nights. Sleep consistency — a steady 30-minute bedtime window — is the clearest first experiment." : "Your #1 lever this month is sleep. Everything else improves when overnight recovery improves. Start with consistent timing." };
+  if (avgStress > 60)   return { label: "Stress management", text: q ? "Evening HR has been running elevated. Building a clearer wind-down — dimmer lights, no screens — may help bring it down." : "Your body is running hot in the evenings. Focus on winding down earlier — this single change tends to cascade into better recovery." };
+  if (avgDebt > 50)     return { label: "Load management",   text: q ? "Recovery debt looks elevated. At least one genuine rest day per week — not active recovery, actual rest — should help." : "More strain is accumulating than is clearing. Introduce at least one genuine rest day per week — not active recovery, actual rest." };
+  if (avgEfficiency < 35) return { label: "Daytime HR",      text: "Your heart is working harder than it needs to during the day. Check hydration, caffeine timing, and consider adding low-intensity movement." };
+  return null;
 }
 
 function generateDayRecommendations(day, prevDay, context = {}) {
@@ -886,16 +917,13 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       day.confidence,
       "Recovery is trending down",
       "Your recent overnight heart rate is running above baseline while recovery has declined versus the longer trend.",
+      "This can reflect accumulated load, reduced sleep quality, or weaker recovery capacity — worth watching if it persists.",
       [
         `Recovery 7d ${Math.round(trends.recovery7d)} vs 14d ${Math.round(trends.recovery14d)}`,
         `Night HR 7d ${Math.round(trends.nightHr7d)} bpm vs baseline ${baseline.restingHR}`,
         `Night coverage 7d ${Math.round(trends.coverageNight7d)}%`,
       ],
-      [
-        "Hold bedtime within 30 minutes for 3 nights",
-        "Skip late alcohol and heavy meals this week",
-        "Reduce one hard session if training has been heavy",
-      ]
+      ["sleep_timing_anchor", "alcohol_free_winddown", "training_spacing"]
     ));
   }
   if (day.activityLevel === "rest" && day.stressSignature > 60) {
@@ -905,15 +933,12 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       day.confidence,
       "Stress remains high on rest days",
       "Your evening or early-morning heart rate stayed elevated without exercise to explain it.",
+      "This pattern is consistent with mental or life stress carrying over into your overnight state.",
       [
         `Stress score ${day.stressSignature}`,
         `Night HR delta ${day.rawMetrics?.baselineDelta ?? "n/a"} bpm`,
       ],
-      [
-        "Build a lighter evening routine",
-        "Stop caffeine earlier in the day",
-        "Use a 10-minute walk after dinner",
-      ]
+      ["evening_decompression", "caffeine_cutoff", "low_intensity_movement"]
     ));
   }
   if (day.nadirHour !== null && day.nadirHour > 5) {
@@ -922,15 +947,13 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       "moderate",
       day.confidence,
       "Your system calmed down late",
-      "The overnight low point arrived later than ideal, which often reflects late load on the system.",
+      "The overnight low point arrived later than the typical 2–3am window.",
+      "A late nadir often reflects late load on the system — food, alcohol, or sustained activation close to sleep.",
       [
         `Nadir at ~${day.nadirHour.toFixed(1)}h`,
         `Coverage night ${day.coverageNight}%`,
       ],
-      [
-        "Finish eating 2–3 hours before bed",
-        "Avoid alcohol close to sleep",
-      ]
+      ["lighter_late_evening", "alcohol_free_winddown"]
     ));
   }
   if (day.eveningDecay !== null && day.eveningDecay > -0.02) {
@@ -940,13 +963,11 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       day.confidence,
       "Your evening wind-down looked flat",
       "Heart rate did not fall much between 8pm and 11pm.",
+      "A flat evening curve suggests the nervous system stayed activated when it should be winding down.",
       [
         `Evening slope ${day.eveningDecay} bpm/min`,
       ],
-      [
-        "Dim lights earlier",
-        "Avoid work and screens late",
-      ]
+      ["evening_decompression"]
     ));
   }
   if (day.acwr !== null && day.acwr > 1.5) {
@@ -956,14 +977,12 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       day.confidence,
       "Training load is spiking",
       "Recent workload is much higher than your rolling baseline.",
+      "A large acute-to-chronic ratio can precede fatigue accumulation and reduced recovery quality if sustained.",
       [
         `ACWR ${day.acwr}`,
         `TRIMP ${day.trimp}`,
       ],
-      [
-        "Deload for several days",
-        "Prioritize sleep and hydration",
-      ]
+      ["training_deload", "sleep_timing_anchor"]
     ));
   }
   if (day.confidence === "low") {
@@ -972,14 +991,12 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       "low",
       "low",
       "Low confidence day",
-      "Night coverage was limited, so interpretations are more directional than definitive.",
+      "Night coverage was limited, so scores are estimates rather than solid readings.",
+      "The surrounding trend is more reliable than this single day — use it as context, not a definitive signal.",
       [
         `Night coverage ${day.coverageNight}%`,
       ],
-      [
-        "Treat this day as a weak signal",
-        "Look at the surrounding trend instead of the single day",
-      ]
+      ["use_surrounding_trend", "data_quality_note"]
     ));
   }
   return recs;
@@ -994,50 +1011,49 @@ function generateRangeRecommendations(days, baseline) {
   const latest = valid[valid.length - 1];
   if (latest) recs.push(...generateDayRecommendations(latest, valid[valid.length - 2] || null, { baseline }));
   if (summary.avgStress > 60 && valid.filter(d => d.activityLevel === "rest" && d.stressSignature > 55).length >= 3) {
-    recs.push(buildRecommendation(
-      "month_high_stress_rest_days",
+    recs.push({ ...buildRecommendation(
+      "high_stress_rest_days",
       "high",
       confidenceSummary.label === "Weak" ? "low" : "medium",
       "Rest-day stress is a month-level theme",
-      "Stress stayed elevated even on easier days, which points more to life load than training load.",
+      "Stress stayed elevated even on easier days across the month.",
+      "When rest-day stress is persistently high, it tends to reflect life or mental load rather than training.",
       [
         `${valid.filter(d => d.activityLevel === "rest" && d.stressSignature > 55).length} stressed rest days`,
         `Weighted month stress ${Math.round(summary.avgStress)}`,
       ],
-      [
-        "Protect a calmer evening routine this week",
-        "Move intense sessions earlier in the day",
-      ]
-    ));
+      ["evening_decompression", "caffeine_cutoff"]
+    ), timeframe: "month" });
   }
   if (confidenceSummary.lowConfidenceDays / valid.length > 0.3) {
-    recs.push(buildRecommendation(
-      "month_low_confidence",
+    recs.push({ ...buildRecommendation(
+      "low_confidence_data_quality",
       "low",
       "low",
       "Data quality limits this month",
-      "A meaningful share of nights had weak coverage, so conclusions should be treated as directional.",
+      "A meaningful share of nights had weak coverage this month.",
+      "Monthly averages based on partial data should be treated as directional rather than precise.",
       [
         `${confidenceSummary.lowConfidenceDays} low-confidence days`,
         `${confidenceSummary.sufficientNightPct}% of nights had sufficient night coverage`,
       ],
-      [
-        "Use the month trend, not isolated days",
-      ]
-    ));
+      ["use_surrounding_trend"]
+    ), timeframe: "month" });
   }
   return recs;
 }
 
 function pickPrimaryRecommendation(recommendations) {
   if (!recommendations || recommendations.length === 0) return null;
-  const severityRank = { high: 3, moderate: 2, low: 1 };
-  const confidenceRank = { high: 3, medium: 2, low: 1 };
-  return [...recommendations].sort((a, b) => {
-    const sevDiff = (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0);
-    if (sevDiff !== 0) return sevDiff;
-    return (confidenceRank[b.confidence] || 0) - (confidenceRank[a.confidence] || 0);
-  })[0];
+  const severityScore   = { high: 40, moderate: 25, low: 10, positive: 0 };
+  const confidenceScore = { high: 20, medium: 10, low: -20 };
+  const persistenceBonus = { recovery_decline_elevated_night_hr: 15, training_load_spike: 15, baseline_drift: 10 };
+  const score = rec =>
+    (severityScore[rec.severity] || 0) +
+    (confidenceScore[rec.confidence] || 0) +
+    (persistenceBonus[rec.id] || 0) +
+    (rec.id?.includes("low_confidence") ? -10 : 0);
+  return [...recommendations].sort((a, b) => score(b) - score(a))[0];
 }
 
 function computeDailySignals(days, baseline, maxHR) {
@@ -1834,14 +1850,13 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
   }
 
   // ── Top priority ──
+  const copyMode = dataQualitySummary.copyMode || "direct";
   let priority = null;
-  if (primaryRecommendation) {
+  if (primaryRecommendation && primaryRecommendation.confidence !== "low") {
     priority = { label: primaryRecommendation.title, text: primaryRecommendation.why, confidence: primaryRecommendation.confidence };
-  } else if (avgRecovery < 45) priority = { label: "Sleep & recovery", text: "Your #1 lever this month is sleep. Everything else improves when overnight recovery improves. Start with consistent timing." };
-  else if (avgStress > 60 && restHighStressDays.length > activeHighStressDays.length) priority = { label: "Stress management", text: "Your body is running hot in the evenings even on rest days. Focus on winding down earlier — this single change will cascade into better recovery and lower debt." };
-  else if (avgDebt > 50) priority = { label: "Load management", text: "You're accumulating more strain than you're clearing. Introduce at least one genuine rest day per week — not active recovery, actual rest." };
-  else if (avgEfficiency < 35 && totalActive < valid.length * 0.2) priority = { label: "Movement", text: "Low cardiovascular efficiency combined with few active days. Even light daily movement (walking, stretching) will bring your daytime HR down and improve all other signals." };
-  else if (avgEfficiency < 35) priority = { label: "Daytime HR", text: "Your heart is working harder than it needs to during the day. Check hydration, caffeine timing, and consider adding low-intensity movement." };
+  } else {
+    priority = buildFallbackPriority(avgRecovery, avgStress, avgDebt, avgEfficiency, copyMode);
+  }
 
   return {
     summary,
@@ -2081,8 +2096,14 @@ function DayDetailModal({ day, baseline, readings, onClose, theme }) {
         {primary && (
           <div style={{ marginBottom: 16, padding: "14px 16px", backgroundColor: "#f4f7f2", borderLeft: `3px solid ${theme.calm}`, borderRadius: 8 }}>
             <div style={{ fontSize: 11, color: theme.calm, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 6 }}>{primary.severity} priority · {primary.confidence} confidence</div>
-            <div style={{ fontSize: 18, color: theme.ink, marginBottom: 4 }}>{primary.title}</div>
-            <div style={{ fontSize: 14, color: theme.soft, lineHeight: 1.6 }}>{primary.why}</div>
+            <div style={{ fontSize: 18, color: theme.ink, marginBottom: 8 }}>{primary.title}</div>
+            <div style={{ fontSize: 14, color: theme.soft, lineHeight: 1.6, marginBottom: primary.interpretation ? 8 : 0 }}>{primary.observation || primary.why}</div>
+            {primary.interpretation && (
+              <div style={{ fontSize: 13, color: theme.faint, lineHeight: 1.6, borderTop: `1px solid ${theme.hair}`, paddingTop: 8 }}>
+                <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginRight: 6, color: theme.calm }}>May suggest</span>
+                {primary.interpretation}
+              </div>
+            )}
           </div>
         )}
 
@@ -2572,11 +2593,14 @@ function HRCoach() {
                 if (avgEff < 40) parts.push(`Cardiovascular efficiency is on the low side (${Math.round(avgEff)}%). Your heart is working harder than it needs to during the day — hydration, caffeine timing, and regular low-intensity movement are the first things to check.`);
 
                 // Top recommendation
-                if (overallPrimary) parts.push(`Top priority: ${overallPrimary.why}`);
-                else if (overallRecovery < 50) parts.push("Top priority: focus on sleep consistency. Go to bed within a 30-minute window every night for two weeks and watch whether your overnight HR responds.");
-                else if (overallStress > 55) parts.push("Top priority: build an evening wind-down. Dim lights, no work email, light activity — give your nervous system a clear signal the day is ending.");
-                else if (avgDebt > 45) parts.push("Top priority: make sure you have at least one genuine low-load day per week. Not active recovery — actual rest.");
-                else parts.push("Your data looks healthy. The main opportunity is consistency — protect the habits that are working and look for small optimisations rather than big changes.");
+                const overallFallback = buildFallbackPriority(overallRecovery, overallStress, avgDebt, avgEff, overallSummary.dataQuality?.copyMode || "direct");
+                if (overallPrimary && overallPrimary.confidence !== "low") {
+                  parts.push(`Top priority: ${overallPrimary.why}`);
+                } else if (overallFallback) {
+                  parts.push(`Top priority: ${overallFallback.text}`);
+                } else {
+                  parts.push("Your data looks healthy. The main opportunity is consistency — protect the habits that are working and look for small optimisations rather than big changes.");
+                }
 
                 return parts.join(" ");
               })()}
