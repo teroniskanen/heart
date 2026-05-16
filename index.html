@@ -4,12 +4,31 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Heart Rate Coach</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&amp;family=Instrument+Serif&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&amp;family=Newsreader:opsz,wght@6..72,300;6..72,400;6..72,500&amp;display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  body { background: #f9f6f0; }
+  html, body { background: #ece4d1; }
+  body { color: #1a1610; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
   #root { min-height: 100vh; }
+  ::selection { background: rgba(168, 72, 42, 0.18); }
+  button { font: inherit; }
+  button:hover { opacity: 0.88; }
+  button:active { transform: translateY(0.5px); }
+  details > summary { list-style: none; outline: none; }
+  details > summary::-webkit-details-marker { display: none; }
 </style>
+<script>
+  // Restore persisted theme bg before React mounts to avoid a flash
+  (function(){
+    try {
+      var t = localStorage.getItem("hrc-theme");
+      var bg = t === "slate" ? "#13161b" : t === "sand" ? "#e2d5bc" : "#ece4d1";
+      var ink = t === "slate" ? "#f1ead8" : "#1a1610";
+      document.documentElement.style.background = bg;
+      document.documentElement.style.color = ink;
+    } catch(e){}
+  })();
+</script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -20,9 +39,9 @@
 const { useState, useCallback, useRef, useEffect, useContext } = React;
 
 const THEMES = {
-  cream: { appBg:"#efe9dc", paper:"#f9f6f0", card:"#fff", ink:"#2a2620", soft:"#6a6055", faint:"#a09888", hair:"#e8e2d8", warm:"#b85c3c", calm:"#5a7a5a", gold:"#c9a961" },
-  sand:  { appBg:"#e7dcc8", paper:"#f7f0e4", card:"#fffaf2", ink:"#2d261c", soft:"#6e6050", faint:"#a08e78", hair:"#ddd0bb", warm:"#b86542", calm:"#647f5c", gold:"#c6a24d" },
-  slate: { appBg:"#20242a", paper:"#2b3037", card:"#343a43", ink:"#f4efe6", soft:"#b0a498", faint:"#7a7068", hair:"#404850", warm:"#d0795a", calm:"#8eaa83", gold:"#d8bc6a" },
+  cream: { appBg:"#ece4d1", paper:"#f4eedd", card:"#fbf6e9", paperAlt:"#efe8d4", ink:"#1a1610", soft:"#544c3f", faint:"#9b9180", hair:"#dcd2bb", rule:"#beb29a", warm:"#a8482a", calm:"#4f7556", gold:"#a67e2a", warmTint:"#f3e0d4", calmTint:"#e3ecdf", goldTint:"#efe6cf", warmInk:"#7a311a", calmInk:"#36513a", goldInk:"#6e521c" },
+  sand:  { appBg:"#e2d5bc", paper:"#f3ebd8", card:"#fbf3df", paperAlt:"#ebe1c8", ink:"#1d1810", soft:"#5a4e3c", faint:"#9a8a72", hair:"#d3c5a8", rule:"#b5a585", warm:"#a85530", calm:"#54704c", gold:"#a17a1f", warmTint:"#f1ddcc", calmTint:"#e1ead7", goldTint:"#ede1c1", warmInk:"#7c3a1d", calmInk:"#3a5132", goldInk:"#6b5012" },
+  slate: { appBg:"#13161b", paper:"#1c1f25", card:"#262a31", paperAlt:"#181b21", ink:"#f1ead8", soft:"#b8aea0", faint:"#7d7567", hair:"#343940", rule:"#4a515a", warm:"#d27050", calm:"#92ae87", gold:"#dabe6a", warmTint:"#3a2820", calmTint:"#26342a", goldTint:"#332b1c", warmInk:"#e89b80", calmInk:"#b8d0ad", goldInk:"#e8d088" },
 };
 const ThemeContext = React.createContext(THEMES.cream);
 window.THEMES = THEMES;
@@ -1882,6 +1901,257 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
 
 // ─── UI Components ───────────────────────────────────────────────────────
 
+function pearson(xs, ys) {
+  const n = xs.length;
+  if (n < 5) return null;
+  let sx = 0, sy = 0;
+  for (let i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; }
+  const mx = sx / n, my = sy / n;
+  let num = 0, dx2 = 0, dy2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx, dy = ys[i] - my;
+    num += dx * dy;
+    dx2 += dx * dx;
+    dy2 += dy * dy;
+  }
+  const den = Math.sqrt(dx2 * dy2);
+  return den > 0 ? num / den : null;
+}
+
+function computeSignalCorrelations(valid, signals) {
+  const results = [];
+  for (let i = 0; i < signals.length; i++) {
+    for (let j = i + 1; j < signals.length; j++) {
+      const xs = [], ys = [];
+      for (const d of valid) {
+        const a = d[signals[i].field], b = d[signals[j].field];
+        if (a !== null && a !== undefined && b !== null && b !== undefined) {
+          xs.push(a); ys.push(b);
+        }
+      }
+      const r = pearson(xs, ys);
+      if (r !== null) results.push({ a: signals[i], b: signals[j], r, n: xs.length });
+    }
+  }
+  results.sort((p, q) => Math.abs(q.r) - Math.abs(p.r));
+  return results;
+}
+
+function CorrelationChips({ valid, signals }) {
+  const T = useContext(ThemeContext);
+  const corrs = computeSignalCorrelations(valid, signals);
+  const significant = corrs.filter(c => Math.abs(c.r) >= 0.4 && c.n >= 8).slice(0, 4);
+  if (significant.length === 0) {
+    return (
+      <div style={{ fontSize: 12, color: T.faint, fontStyle: "italic", marginBottom: 18 }}>
+        No strong correlations between signals this month — they're moving independently.
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ fontSize: 10, color: T.faint, letterSpacing: "0.2em", textTransform: "uppercase", fontWeight: 700, marginBottom: 10 }}>How signals moved together</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {significant.map((c, i) => {
+          const absR = Math.abs(c.r);
+          const strength = absR >= 0.7 ? "strong" : absR >= 0.55 ? "moderate" : "modest";
+          const isInverse = c.r < 0;
+          const accent = isInverse ? T.warm : T.calm;
+          const accentInk = isInverse ? T.warmInk : T.calmInk;
+          const accentTint = isInverse ? T.warmTint : T.calmTint;
+          return (
+            <div key={i} style={{
+              display: "inline-flex", alignItems: "center", gap: 9,
+              padding: "8px 13px", borderRadius: 3,
+              backgroundColor: accentTint, borderLeft: `2px solid ${accent}`,
+              fontSize: 12, color: accentInk, fontFamily: "'DM Sans', sans-serif",
+            }}>
+              <span style={{ fontWeight: 600 }}>{c.a.short}</span>
+              <span style={{ color: accent, fontSize: 13, lineHeight: 1, fontWeight: 700 }}>{isInverse ? "⇅" : "≈"}</span>
+              <span style={{ fontWeight: 600 }}>{c.b.short}</span>
+              <span style={{ opacity: 0.78, fontSize: 11, letterSpacing: "0.04em", marginLeft: 2 }}>
+                {strength} {isInverse ? "inverse" : "match"}
+              </span>
+              <span style={{ color: T.faint, fontSize: 11, fontVariantNumeric: "tabular-nums", marginLeft: 2 }}>
+                r {c.r > 0 ? "+" : ""}{c.r.toFixed(2)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RibbonCalendar({ valid, signals, expandedField, onExpand }) {
+  const T = useContext(ThemeContext);
+  if (valid.length === 0) return null;
+
+  // Per-signal percentile thresholds (computed across this month's valid days)
+  const thresholds = signals.map(s => {
+    const values = valid.map(d => d[s.field]).filter(v => v !== null && v !== undefined);
+    const sorted = [...values].sort((a, b) => a - b);
+    let lo = sorted[Math.floor(sorted.length * 0.25)];
+    let hi = sorted[Math.floor(sorted.length * 0.75)];
+    if (hi - lo < 5) { const m = (lo + hi) / 2; lo = m - 3; hi = m + 3; }
+    return { lo, hi };
+  });
+
+  const firstDate = new Date(valid[0].date);
+  const year = firstDate.getFullYear();
+  const month = firstDate.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const firstDow = (new Date(year, month, 1).getDay() + 6) % 7;
+
+  const dayMap = {};
+  valid.forEach(d => { dayMap[d.date] = d; });
+
+  const cells = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dk = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    cells.push({ day, dateKey: dk, record: dayMap[dk] });
+  }
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+
+  const dayNumH = 16;
+  const bandH = 6;
+  const bandGap = 2;
+  const cellH = dayNumH + signals.length * (bandH + bandGap) + 4;
+  const dowLabels = ["M", "T", "W", "T", "F", "S", "S"];
+  const qColors = [T.warm, T.gold, T.calm];
+
+  const qualityFor = (record, i) => {
+    if (!record || record.incomplete) return null;
+    const v = record[signals[i].field];
+    if (v === null || v === undefined) return null;
+    const { lo, hi } = thresholds[i];
+    if (signals[i].isInverse) return v < lo ? 2 : v > hi ? 0 : 1;
+    return v > hi ? 2 : v < lo ? 0 : 1;
+  };
+
+  const expandedIdx = expandedField ? signals.findIndex(s => s.field === expandedField) : -1;
+  const expandedThresholds = expandedIdx >= 0 ? thresholds[expandedIdx] : null;
+
+  return (
+    <div>
+      {/* Band legend / toggle */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 18, alignItems: "center" }}>
+        <span style={{ fontSize: 10, color: T.faint, letterSpacing: "0.2em", textTransform: "uppercase", fontWeight: 700, marginRight: 6 }}>Bands ↓</span>
+        {signals.map((s, i) => {
+          const active = expandedField === s.field;
+          return (
+            <button
+              key={s.field}
+              onClick={() => onExpand(active ? null : s.field)}
+              title={active ? "Collapse" : `Expand ${s.label}`}
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 7,
+                padding: "5px 11px 5px 7px", fontSize: 11, fontWeight: 500,
+                fontFamily: "'DM Sans', sans-serif",
+                border: `1px solid ${active ? T.ink : T.hair}`,
+                backgroundColor: active ? T.ink : "transparent",
+                color: active ? T.paper : T.ink,
+                borderRadius: 999, cursor: "pointer",
+                transition: "all .12s ease", letterSpacing: "0.02em",
+              }}>
+              <span style={{
+                fontFamily: "'Newsreader', serif", fontSize: 13,
+                color: active ? T.paper : T.faint,
+                fontVariantNumeric: "tabular-nums", lineHeight: 1, minWidth: 8, textAlign: "center",
+              }}>{i + 1}</span>
+              <span>{s.short}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Quality legend */}
+      <div style={{ display: "flex", gap: 14, marginBottom: 14, fontSize: 11, color: T.faint, alignItems: "center" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.calm }} /> good</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.gold }} /> typical</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.warm }} /> attention</span>
+        <span style={{ marginLeft: "auto", letterSpacing: "0.1em" }}>{valid.length} days · thresholds from this month</span>
+      </div>
+
+      {/* Ribbon calendar */}
+      <div style={{ maxWidth: 520 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 4, marginBottom: 6 }}>
+          {dowLabels.map((l, i) => (
+            <div key={i} style={{ fontSize: 9.5, color: T.faint, textAlign: "center", letterSpacing: "0.18em", fontWeight: 700 }}>{l}</div>
+          ))}
+        </div>
+        {weeks.map((week, wi) => (
+          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 4, marginBottom: 4 }}>
+            {Array.from({ length: 7 }, (_, di) => {
+              const cell = week[di];
+              if (!cell) return <div key={di} style={{ height: cellH }} />;
+              const rec = cell.record;
+              const missing = !rec || rec.incomplete;
+              const qualities = signals.map((_, i) => qualityFor(rec, i));
+              // Day-level summary tint (avg quality across signals)
+              const validQs = qualities.filter(q => q !== null);
+              const avgQ = validQs.length ? validQs.reduce((s, q) => s + q, 0) / validQs.length : null;
+              const dayDot = avgQ === null ? T.hair : avgQ >= 1.5 ? T.calm : avgQ <= 0.5 ? T.warm : T.gold;
+              return (
+                <div key={di} title={rec ? `${cell.day} · ${signals.map((s, i) => `${s.short}: ${rec[s.field] ?? "—"}`).join(" · ")}` : `${cell.day} · no data`}
+                  style={{
+                    height: cellH,
+                    backgroundColor: T.paperAlt,
+                    border: `1px solid ${T.hair}`,
+                    borderRadius: 3,
+                    padding: 4,
+                    display: "flex", flexDirection: "column",
+                    opacity: missing ? 0.55 : 1,
+                    boxSizing: "border-box",
+                    minWidth: 0,
+                  }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", height: dayNumH - 4, marginBottom: 4, paddingLeft: 2, paddingRight: 2 }}>
+                    <span style={{ fontSize: 10, color: T.soft, fontWeight: 600, fontVariantNumeric: "tabular-nums", letterSpacing: "0.02em" }}>{cell.day}</span>
+                    <span style={{ width: 4, height: 4, borderRadius: "50%", backgroundColor: dayDot, opacity: missing ? 0.4 : 1 }} />
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: bandGap }}>
+                    {qualities.map((q, i) => {
+                      const highlighted = expandedField === null || expandedField === signals[i].field;
+                      return (
+                        <div key={i}
+                          style={{
+                            height: bandH,
+                            borderRadius: 1,
+                            backgroundColor: q === null ? T.hair : qColors[q],
+                            opacity: highlighted ? (q === null ? 0.5 : 1) : 0.18,
+                            transition: "opacity .15s ease",
+                          }} />
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      {/* Expanded signal detail */}
+      {expandedIdx >= 0 && (
+        <div style={{ marginTop: 22, paddingTop: 18, borderTop: `1px solid ${T.hair}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12, gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 10, color: T.faint, letterSpacing: "0.2em", textTransform: "uppercase", fontWeight: 700, marginBottom: 4 }}>Expanded · band {expandedIdx + 1}</div>
+              <div style={{ fontFamily: "'Newsreader', serif", fontSize: 22, color: T.ink, lineHeight: 1.1 }}>{signals[expandedIdx].label}</div>
+            </div>
+            <div style={{ fontSize: 10, color: T.faint, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>
+              p25 {Math.round(expandedThresholds.lo)} · p75 {Math.round(expandedThresholds.hi)}
+            </div>
+          </div>
+          <GridHeatmap signals={valid} field={signals[expandedIdx].field} label="" isInverse={signals[expandedIdx].isInverse} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GridHeatmap({ signals, field, label, isInverse }) {
   const T = useContext(ThemeContext);
   const valid = signals.filter(d => !d.incomplete);
@@ -1928,25 +2198,31 @@ function GridHeatmap({ signals, field, label, isInverse }) {
   }
   const colors = [T.warm, T.gold, T.calm];
   const dowLabels = ["M", "T", "W", "T", "F", "S", "S"];
+  const cellSize = 26;
 
   return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ fontSize: 11, color: T.soft, marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, gap: 12 }}>
+        <div style={{ fontSize: 12, color: T.ink, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.04em", fontWeight: 500 }}>{label}</div>
+        <div style={{ fontSize: 10, color: T.faint, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>p25 {Math.round(lo)} · p75 {Math.round(hi)}</div>
+      </div>
       <div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 22px)", gap: 2, marginBottom: 2 }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(7, ${cellSize}px)`, gap: 3, marginBottom: 4 }}>
           {dowLabels.map((l, i) => (
-            <div key={i} style={{ fontSize: 9, color: T.faint, textAlign: "center" }}>{l}</div>
+            <div key={i} style={{ fontSize: 9, color: T.faint, textAlign: "center", letterSpacing: "0.1em", fontWeight: 600 }}>{l}</div>
           ))}
         </div>
         {weeks.map((week, wi) => (
-          <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 22px)", gap: 2, marginBottom: 2 }}>
+          <div key={wi} style={{ display: "grid", gridTemplateColumns: `repeat(7, ${cellSize}px)`, gap: 3, marginBottom: 3 }}>
             {Array.from({ length: 7 }, (_, di) => {
               const cell = week[di];
-              if (!cell) return <div key={di} style={{ width: 22, height: 18, borderRadius: 3 }} />;
-              if (cell.empty) return <div key={di} style={{ width: 22, height: 18, borderRadius: 3, backgroundColor: T.paper }} />;
+              if (!cell) return <div key={di} style={{ width: cellSize, height: 22, borderRadius: 2 }} />;
+              if (cell.empty) return <div key={di} style={{ width: cellSize, height: 22, borderRadius: 2, backgroundColor: T.paperAlt, border: `1px dashed ${T.hair}`, boxSizing: "border-box" }} />;
               return (
                 <div key={di} title={`${cell.day}: ${cell.value}`}
-                  style={{ width: 22, height: 18, borderRadius: 3, backgroundColor: colors[cell.quality], opacity: 0.88 }} />
+                  style={{ width: cellSize, height: 22, borderRadius: 2, backgroundColor: colors[cell.quality], display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,0.92)", fontSize: 9, fontWeight: 600, letterSpacing: "0.02em", fontFamily: "'DM Sans', sans-serif" }}>
+                  {cell.day}
+                </div>
               );
             })}
           </div>
@@ -1989,22 +2265,25 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
   const dowLabels = ["M", "T", "W", "T", "F", "S", "S"];
 
   return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ fontSize: 11, color: T.soft, marginBottom: 6, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.05em", textTransform: "uppercase" }}>{label}</div>
-      <div style={{ display: "flex", gap: 1, overflowX: "auto", WebkitOverflowScrolling: "touch", paddingBottom: 4 }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 1, marginRight: 4 }}>
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8, gap: 12 }}>
+        <div style={{ fontSize: 12.5, color: T.ink, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.02em", fontWeight: 500 }}>{label}</div>
+        <div style={{ fontSize: 10, color: T.faint, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 }}>p25 {Math.round(lo)} · p75 {Math.round(hi)}</div>
+      </div>
+      <div style={{ display: "flex", gap: 2, overflowX: "auto", WebkitOverflowScrolling: "touch", paddingBottom: 6 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginRight: 6 }}>
           {dowLabels.map((l, i) => (
-            <div key={i} style={{ width: 12, height: 13, fontSize: 9, color: T.faint, display: "flex", alignItems: "center", justifyContent: "center" }}>{i % 2 === 1 ? l : ""}</div>
+            <div key={i} style={{ width: 14, height: 14, fontSize: 9, color: T.faint, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 600 }}>{i % 2 === 1 ? l : ""}</div>
           ))}
         </div>
         {weeks.map((week, wi) => (
-          <div key={wi} style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+          <div key={wi} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             {Array.from({ length: 7 }, (_, di) => {
               const cell = week[di];
-              if (!cell) return <div key={di} style={{ width: 13, height: 13, borderRadius: 2, backgroundColor: T.paper }} />;
+              if (!cell) return <div key={di} style={{ width: 14, height: 14, borderRadius: 2, backgroundColor: T.paperAlt }} />;
               return (
                 <div key={di} title={`${fmtDate(cell.date)}: ${cell.value}`}
-                  style={{ width: 13, height: 13, borderRadius: 2, backgroundColor: colors[cell.quality], opacity: 0.85, cursor: "default" }} />
+                  style={{ width: 14, height: 14, borderRadius: 2, backgroundColor: colors[cell.quality], cursor: "default" }} />
               );
             })}
           </div>
@@ -2022,8 +2301,8 @@ function SparkLine({ data, baseline }) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const W = canvas.width = canvas.offsetWidth * 2;
-    const H = canvas.height = 140 * 2;
-    canvas.style.height = "140px";
+    const H = canvas.height = 160 * 2;
+    canvas.style.height = "160px";
     ctx.scale(2, 2);
     const w = W / 2, h = H / 2;
     const values = data.map(d => d.hr);
@@ -2031,38 +2310,71 @@ function SparkLine({ data, baseline }) {
     const max = Math.max(...values, baseline) + 3;
     const range = max - min || 1;
     ctx.clearRect(0, 0, w, h);
-    const by = h - 20 - ((baseline - min) / range) * (h - 40);
+
+    // Subtle grid — quarter lines
     ctx.strokeStyle = T.hair;
-    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const gy = 20 + (i / 4) * (h - 40);
+      ctx.beginPath();
+      ctx.moveTo(36, gy);
+      ctx.lineTo(w - 10, gy);
+      ctx.stroke();
+    }
+
+    // Baseline dashed
+    const by = h - 20 - ((baseline - min) / range) * (h - 40);
+    ctx.strokeStyle = T.rule;
+    ctx.setLineDash([3, 4]);
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(30, by);
+    ctx.moveTo(36, by);
     ctx.lineTo(w - 10, by);
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = T.faint;
     ctx.font = "10px 'DM Sans', sans-serif";
     ctx.fillText(`${baseline}`, 4, by + 3);
+
+    // Area fill under line
+    const points = values.map((v, i) => ({
+      x: 36 + (i / Math.max(1, values.length - 1)) * (w - 46),
+      y: h - 20 - ((v - min) / range) * (h - 40),
+    }));
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, T.calm + "40");
+    grad.addColorStop(1, T.calm + "08");
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, h - 20);
+    points.forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.lineTo(points[points.length - 1].x, h - 20);
+    ctx.closePath();
+    ctx.fill();
+
+    // Line
     ctx.strokeStyle = T.calm;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 1.75;
     ctx.lineJoin = "round";
     ctx.beginPath();
-    for (let i = 0; i < values.length; i++) {
-      const x = 30 + (i / (values.length - 1)) * (w - 40);
-      const y = h - 20 - ((values[i] - min) / range) * (h - 40);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
+    points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
     ctx.stroke();
+
+    // Dots
     for (let i = 0; i < values.length; i++) {
-      const x = 30 + (i / (values.length - 1)) * (w - 40);
-      const y = h - 20 - ((values[i] - min) / range) * (h - 40);
-      ctx.fillStyle = values[i] > baseline + 2 ? T.warm : T.calm;
+      const p = points[i];
+      const elevated = values[i] > baseline + 2;
+      ctx.fillStyle = elevated ? T.warm : T.calm;
       ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = T.card;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 1, 0, Math.PI * 2);
       ctx.fill();
     }
   }, [data, baseline, T]);
-  return <canvas ref={canvasRef} style={{ width: "100%", height: 140, display: "block" }} />;
+  return <canvas ref={canvasRef} style={{ width: "100%", height: 160, display: "block" }} />;
 }
 
 function buildHourlySeries(readings) {
@@ -2087,16 +2399,16 @@ function DayDetailModal({ day, baseline, readings, onClose, theme }) {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", marginBottom: 16 }}>
           <div>
             <div style={{ fontSize: 11, color: theme.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600 }}>Day detail</div>
-            <h2 style={{ fontFamily: "'Instrument Serif', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.1, margin: "6px 0 4px" }}>{new Date(day.date).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })}</h2>
+            <h2 style={{ fontFamily: "'Newsreader', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.1, margin: "6px 0 4px" }}>{new Date(day.date).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })}</h2>
             <div style={{ fontSize: 13, color: theme.soft }}>{confidenceLabel(day.confidence)} · Night coverage {day.coverageNight}%</div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: `1px solid ${theme.hair}`, color: theme.soft, borderRadius: 6, padding: "6px 12px", cursor: "pointer" }}>Close</button>
         </div>
 
         {primary && (
-          <div style={{ marginBottom: 16, padding: "14px 16px", backgroundColor: "#f4f7f2", borderLeft: `3px solid ${theme.calm}`, borderRadius: 8 }}>
-            <div style={{ fontSize: 11, color: theme.calm, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 6 }}>{primary.severity} priority · {primary.confidence} confidence</div>
-            <div style={{ fontSize: 18, color: theme.ink, marginBottom: 8 }}>{primary.title}</div>
+          <div style={{ marginBottom: 18, padding: "16px 18px", backgroundColor: theme.calmTint, borderLeft: `2px solid ${theme.calm}`, borderRadius: 3 }}>
+            <div style={{ fontSize: 10, color: theme.calmInk, textTransform: "uppercase", letterSpacing: "0.16em", fontWeight: 700, marginBottom: 8 }}>{primary.severity} priority · {primary.confidence} confidence</div>
+            <div style={{ fontSize: 20, color: theme.ink, marginBottom: 8, fontFamily: "'Newsreader', serif", lineHeight: 1.2 }}>{primary.title}</div>
             <div style={{ fontSize: 14, color: theme.soft, lineHeight: 1.6, marginBottom: primary.interpretation ? 8 : 0 }}>{primary.observation || primary.why}</div>
             {primary.interpretation && (
               <div style={{ fontSize: 13, color: theme.faint, lineHeight: 1.6, borderTop: `1px solid ${theme.hair}`, paddingTop: 8 }}>
@@ -2108,10 +2420,10 @@ function DayDetailModal({ day, baseline, readings, onClose, theme }) {
         )}
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 10, marginBottom: 16 }}>
-          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Baseline</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{baseline.restingHR}</div></div>
-          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night mean</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.nightMeanHR ?? "—"}</div></div>
-          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night range</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.rawMetrics?.nightMinHR ?? "—"}–{day.rawMetrics?.nightMaxHR ?? "—"}</div></div>
-          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Coverage</div><div style={{ fontSize: 22, fontFamily: "'Instrument Serif', serif" }}>{day.coverageTotal}%</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Baseline</div><div style={{ fontSize: 22, fontFamily: "'Newsreader', serif" }}>{baseline.restingHR}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night mean</div><div style={{ fontSize: 22, fontFamily: "'Newsreader', serif" }}>{day.nightMeanHR ?? "—"}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Night range</div><div style={{ fontSize: 22, fontFamily: "'Newsreader', serif" }}>{day.rawMetrics?.nightMinHR ?? "—"}–{day.rawMetrics?.nightMaxHR ?? "—"}</div></div>
+          <div style={{ padding: "10px 12px", backgroundColor: theme.paper, borderRadius: 8 }}><div style={{ fontSize: 11, color: theme.faint, textTransform: "uppercase" }}>Coverage</div><div style={{ fontSize: 22, fontFamily: "'Newsreader', serif" }}>{day.coverageTotal}%</div></div>
         </div>
 
         <div style={{ marginBottom: 18 }}>
@@ -2121,9 +2433,9 @@ function DayDetailModal({ day, baseline, readings, onClose, theme }) {
               const hourNum = parseInt(point.hour, 10);
               const nightHour = hourNum >= NIGHT_START && hourNum <= NIGHT_END;
               return (
-                <div key={point.hour} style={{ padding: "8px 6px", borderRadius: 8, backgroundColor: nightHour ? "#f7efe7" : theme.paper, border: `1px solid ${nightHour ? "#ead7c0" : theme.hair}`, textAlign: "center" }}>
+                <div key={point.hour} style={{ padding: "10px 6px", borderRadius: 3, backgroundColor: nightHour ? theme.warmTint : theme.paperAlt, border: `1px solid ${nightHour ? theme.warm + "40" : theme.hair}`, textAlign: "center" }}>
                   <div style={{ fontSize: 11, color: theme.faint }}>{point.hour}</div>
-                  <div style={{ fontSize: 17, fontFamily: "'Instrument Serif', serif", color: point.bpm > baseline.restingHR ? theme.warm : theme.ink }}>{point.bpm}</div>
+                  <div style={{ fontSize: 17, fontFamily: "'Newsreader', serif", color: point.bpm > baseline.restingHR ? theme.warm : theme.ink }}>{point.bpm}</div>
                 </div>
               );
             })}
@@ -2165,6 +2477,42 @@ function DayDetailModal({ day, baseline, readings, onClose, theme }) {
 
 // ─── Main App ──────────────────────────────────────────────────────────────
 
+function ThemeToggle({ themeName, setThemeName }) {
+  const T = useContext(ThemeContext);
+  const themes = [
+    { key: "cream", label: "Cream", swatch: "#f4eedd" },
+    { key: "sand",  label: "Sand",  swatch: "#e2d5bc" },
+    { key: "slate", label: "Dark",  swatch: "#1c1f25" },
+  ];
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 0, backgroundColor: T.card, border: `1px solid ${T.hair}`, borderRadius: 999, padding: 3 }}>
+      {themes.map(t => {
+        const active = themeName === t.key;
+        return (
+          <button
+            key={t.key}
+            onClick={() => setThemeName(t.key)}
+            title={t.label}
+            aria-label={`${t.label} theme`}
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 6,
+              padding: active ? "5px 11px 5px 6px" : "5px 6px",
+              border: "none", background: active ? T.paperAlt : "transparent",
+              borderRadius: 999, cursor: "pointer",
+              fontFamily: "'DM Sans', sans-serif", fontSize: 10, fontWeight: 600,
+              letterSpacing: "0.12em", textTransform: "uppercase",
+              color: active ? T.ink : T.faint, transition: "all .15s ease",
+            }}
+          >
+            <span style={{ width: 13, height: 13, borderRadius: "50%", backgroundColor: t.swatch, border: `1px solid ${active ? T.rule : T.hair}`, display: "inline-block", flexShrink: 0 }} />
+            {active && <span>{t.label}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function HRCoach() {
   const [rawInput, setRawInput] = useState(() => readStorage(STORAGE_KEYS.raw, ""));
   const [result, setResult] = useState(() => safeJsonParse(readStorage(STORAGE_KEYS.analysis), null));
@@ -2182,6 +2530,16 @@ function HRCoach() {
   const [themeName, setThemeName] = useState(() => readStorage(STORAGE_KEYS.theme, "cream"));
   const [accentWarm, setAccentWarm] = useState(() => readStorage(STORAGE_KEYS.accentWarm, THEMES.cream.warm));
   const [selectedDay, setSelectedDay] = useState(null);
+  const [expandedSignal, setExpandedSignal] = useState(null);
+
+  const MONTH_SIGNAL_METRICS = [
+    { field: "recoveryQuality",   label: "Recovery Quality",        short: "Recovery",   isInverse: false },
+    { field: "stressSignature",   label: "Stress Signature",        short: "Stress",     isInverse: true  },
+    { field: "recoveryDebt",      label: "Recovery Debt",           short: "Debt",       isInverse: true  },
+    { field: "cardioEfficiency",  label: "Cardiovascular Efficiency", short: "Efficiency", isInverse: false },
+    { field: "autonomicLoad",     label: "Autonomic Load",          short: "Load",       isInverse: true  },
+    { field: "pulseStability",    label: "Pulse Stability",         short: "Pulse",      isInverse: false },
+  ];
 
   const activeTheme = { ...(THEMES[themeName] || THEMES.cream), warm: accentWarm || (THEMES[themeName] || THEMES.cream).warm };
   const S = getStyles(activeTheme);
@@ -2310,14 +2668,17 @@ function HRCoach() {
       <div style={S.shell}>
         <div style={S.importWrap}>
           <div style={S.importInner}>
-            <div style={S.eyebrow}>Heart Rate Coach</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ ...S.eyebrow, marginBottom: 0 }}>Heart Rate Coach</div>
+              <ThemeToggle themeName={themeName} setThemeName={setThemeName} />
+            </div>
             <h1 style={S.importTitle}>What your heart rate<br />has been telling you</h1>
             <p style={S.importSub}>
               Everything runs in-browser — nothing leaves your device.
             </p>
 
             {loading && (
-              <div style={{ padding: 32, textAlign: "center", color: "#5a8a64", fontSize: 15, fontWeight: 500 }}>
+              <div style={{ padding: 32, textAlign: "center", color: activeTheme.calm, fontSize: 14, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase" }}>
                 Analysing your data…
               </div>
             )}
@@ -2325,15 +2686,15 @@ function HRCoach() {
             {!loading && (
               <>
                 {importError && (
-                  <div style={{ padding: "12px 14px", borderRadius: 8, backgroundColor: "#f8f0ec", border: "1px solid #e7c4b0", color: "#8a4a2a", fontSize: 13, lineHeight: 1.55, marginBottom: 16 }}>
+                  <div style={{ padding: "12px 14px", borderRadius: 3, backgroundColor: activeTheme.warmTint, borderLeft: `2px solid ${activeTheme.warm}`, color: activeTheme.warmInk, fontSize: 13, lineHeight: 1.55, marginBottom: 16 }}>
                     {importError}
                   </div>
                 )}
 
                 {importPreview && (
-                  <div style={{ padding: "16px 14px", borderRadius: 10, backgroundColor: "#f4f7f2", border: "1px solid #c8d8c4", marginBottom: 18 }}>
-                    <div style={{ fontSize: 11, color: "#5a7a5a", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>Import summary</div>
-                    <div style={{ fontSize: 13, color: "#3a5a3a", lineHeight: 1.6 }}>
+                  <div style={{ padding: "18px 18px", borderRadius: 3, backgroundColor: activeTheme.calmTint, borderLeft: `2px solid ${activeTheme.calm}`, marginBottom: 20 }}>
+                    <div style={{ fontSize: 10, color: activeTheme.calmInk, letterSpacing: "0.2em", textTransform: "uppercase", fontWeight: 700, marginBottom: 10 }}>Import summary</div>
+                    <div style={{ fontSize: 13, color: activeTheme.calmInk, lineHeight: 1.7 }}>
                       <div>{importPreview.parsed.toLocaleString("en-GB")} readings parsed · {importPreview.skipped.toLocaleString("en-GB")} skipped</div>
                       {importPreview.start && importPreview.end && (
                         <div>{importPreview.start.toLocaleDateString("en-CA")} → {importPreview.end.toLocaleDateString("en-CA")}</div>
@@ -2345,7 +2706,7 @@ function HRCoach() {
                       <button style={{ ...S.btnPrimary, padding: "10px 18px" }} onClick={() => { setImportError(""); setLoading(true); setTimeout(() => runAnalysis(pendingText || rawInput), 50); }}>Run analysis</button>
                       <button style={S.btnGhost} onClick={() => { setImportPreview(null); setPendingText(""); }}>Clear</button>
                     </div>
-                    <div style={{ marginTop: 10, fontSize: 12, color: "#6a8a6a" }}>Nothing is uploaded. Analysis runs only on this device.</div>
+                    <div style={{ marginTop: 12, fontSize: 11.5, color: activeTheme.calmInk, opacity: 0.78, fontStyle: "italic" }}>Nothing is uploaded. Analysis runs only on this device.</div>
                   </div>
                 )}
                 <label
@@ -2358,13 +2719,14 @@ function HRCoach() {
                   }}
                   style={{
                     display: "block",
-                    border: `2px dashed ${dragActive ? activeTheme.warm : activeTheme.hair}`,
-                    borderRadius: 10,
-                    padding: "24px 16px",
+                    border: `1px ${dragActive ? "solid" : "dashed"} ${dragActive ? activeTheme.ink : activeTheme.rule}`,
+                    borderRadius: 3,
+                    padding: "32px 20px",
                     textAlign: "center",
                     cursor: "pointer",
-                    backgroundColor: dragActive ? activeTheme.card : activeTheme.paper,
-                    marginBottom: 24,
+                    backgroundColor: dragActive ? activeTheme.paperAlt : activeTheme.card,
+                    marginBottom: 12,
+                    transition: "all .15s ease",
                   }}
                 >
                   <input
@@ -2373,14 +2735,14 @@ function HRCoach() {
                     onChange={(e) => handleFile(e.target.files[0])}
                     style={{ display: "none" }}
                   />
-                  <div style={{ fontSize: 28, marginBottom: 8 }}>📂</div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: activeTheme.ink, marginBottom: 4 }}>Drop a .csv / .txt file or click to browse</div>
-                  <div style={{ fontSize: 13, color: activeTheme.soft }}>{fileName ? `Loaded: ${fileName}` : ".txt, .csv, or .tsv file"}</div>
+                  <div style={{ fontSize: 32, marginBottom: 10, fontFamily: "'Newsreader', serif", color: activeTheme.faint, lineHeight: 1 }}>↧</div>
+                  <div style={{ fontSize: 15, fontWeight: 500, color: activeTheme.ink, marginBottom: 6 }}>{fileName ? "Replace file" : "Drop your export, or click to browse"}</div>
+                  <div style={{ fontSize: 12, color: activeTheme.faint, letterSpacing: "0.04em" }}>{fileName ? `Loaded · ${fileName}` : ".txt, .csv, or .tsv"}</div>
                 </label>
 
                 {/* Fallback: Paste */}
                 <details style={{ marginBottom: 16 }}>
-                  <summary style={{ fontSize: 13, color: "#8a8070", cursor: "pointer", marginBottom: 8 }}>Or paste data manually</summary>
+                  <summary style={{ fontSize: 12, color: activeTheme.soft, cursor: "pointer", marginBottom: 8, letterSpacing: "0.04em" }}>Or paste data manually</summary>
                   <textarea
                     value={rawInput}
                     onChange={(e) => setRawInput(e.target.value)}
@@ -2398,16 +2760,16 @@ function HRCoach() {
                 <div style={S.fmtNote}>Expected format: <code style={S.code}>DD/MM/YYYY	HH:MM	BPM</code> — one reading per line.</div>
                 {persistWarning && <div style={{ marginTop: 10, fontSize: 12, color: activeTheme.warm }}>{persistWarning}</div>}
 
-                <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12 }}>
-                  <label style={{ fontSize: 13, color: "#6a6055", flexShrink: 0 }}>Your age <span style={{ color: "#a09888" }}>(for activity zones)</span></label>
+                <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${activeTheme.hair}`, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                  <label style={{ fontSize: 13, color: activeTheme.soft, flexShrink: 0 }}>Your age <span style={{ color: activeTheme.faint }}>(for activity zones)</span></label>
                   <input
                     type="number" min="10" max="100" value={age}
                     onChange={e => setAge(e.target.value)}
                     placeholder="e.g. 35"
-                    style={{ width: 80, padding: "6px 10px", fontSize: 14, border: "1px solid #d0c8b8", borderRadius: 6, backgroundColor: "#fff", color: "#2a2520", fontFamily: "'DM Sans', sans-serif", outline: "none" }}
+                    style={{ width: 80, padding: "7px 10px", fontSize: 14, border: `1px solid ${activeTheme.rule}`, borderRadius: 3, backgroundColor: activeTheme.card, color: activeTheme.ink, fontFamily: "'DM Sans', sans-serif", outline: "none" }}
                   />
                   {age && !isNaN(parseInt(age)) && (
-                    <span style={{ fontSize: 12, color: "#8a8070" }}>
+                    <span style={{ fontSize: 12, color: activeTheme.faint }}>
                       Max HR: ~{Math.round(208 - 0.7 * parseInt(age))} bpm (Tanaka)
                     </span>
                   )}
@@ -2451,7 +2813,8 @@ function HRCoach() {
                 <h1 style={S.title}>Your health profile</h1>
                 <div style={S.meta}>{dataQuality.totalDays} days · {dateRange} · {dataQuality.validDays} with good coverage</div>
               </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                <ThemeToggle themeName={themeName} setThemeName={setThemeName} />
                 <button style={S.btnGhost} onClick={handleCopySummary}>{copied ? "✓ Copied" : "Copy summary"}</button>
                 <button style={S.btnGhost} onClick={resetAnalysis}>← New data</button>
               </div>
@@ -2478,7 +2841,7 @@ function HRCoach() {
               </div>
               {lastValid && lastValid.dynamicBaseline !== undefined && (
                 <div style={S.baseStat}>
-                  <div style={{ ...S.bigNum, color: lastValid.dynamicBaseline < baseline.restingHR ? "#5a8a64" : lastValid.dynamicBaseline > baseline.restingHR + 2 ? "#c45a3a" : "#1a1510" }}>
+                  <div style={{ ...S.bigNum, color: lastValid.dynamicBaseline < baseline.restingHR ? activeTheme.calm : lastValid.dynamicBaseline > baseline.restingHR + 2 ? activeTheme.warm : activeTheme.ink }}>
                     {lastValid.dynamicBaseline}
                   </div>
                   <div style={S.statLabel}>Current (adaptive)</div>
@@ -2505,10 +2868,10 @@ function HRCoach() {
           <div style={S.card}>
             <div style={S.cardLabel}>Signal overview · full period</div>
             <p style={S.cardSub}>Weeks as columns, days as rows. Thresholds from your own data (25th / 75th percentile).</p>
-            <div style={{ display: "flex", gap: 6, marginBottom: 12, fontSize: 11, color: "#8a8478" }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: "hsl(145, 38%, 42%)", display: "inline-block" }} /> good for you</span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: "hsl(38, 40%, 58%)", display: "inline-block" }} /> typical</span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: "hsl(4, 60%, 50%)", display: "inline-block" }} /> attention</span>
+            <div style={{ display: "flex", gap: 14, marginBottom: 14, fontSize: 11, color: activeTheme.faint, alignItems: "center" }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: activeTheme.calm, display: "inline-block" }} /> good for you</span>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: activeTheme.gold, display: "inline-block" }} /> typical</span>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: activeTheme.warm, display: "inline-block" }} /> attention</span>
             </div>
             <FullGridHeatmap signals={validDays} field="recoveryQuality" label="Recovery Quality" isInverse={false} />
             <FullGridHeatmap signals={validDays} field="autonomicLoad" label="Autonomic Load" isInverse={true} />
@@ -2529,10 +2892,10 @@ function HRCoach() {
               <div style={S.cardLabel}>What the data tells me</div>
               <p style={S.cardSub}>Patterns found across your full recording period.</p>
               {patterns.map((p, i) => (
-                <div key={i} style={{ ...S.insight, borderLeftColor: p.severity === "positive" ? "#5a8a64" : p.severity === "warning" ? "#c47a3a" : "#7a8a9a" }}>
+                <div key={i} style={{ ...S.insight, borderLeftColor: p.severity === "positive" ? activeTheme.calm : p.severity === "warning" ? activeTheme.warm : activeTheme.rule }}>
                   <div style={S.insightTitle}>{p.title}</div>
                   <div style={S.insightBody}>{p.detail}</div>
-                  {p.guidance && <div style={{ fontSize: 13, color: "#5a6a5a", lineHeight: 1.65, marginTop: 10, padding: "10px 14px", backgroundColor: "#f4f7f2", borderRadius: 6, fontStyle: "italic" }}>💡 {p.guidance}</div>}
+                  {p.guidance && <div style={{ fontSize: 13.5, color: activeTheme.calmInk, lineHeight: 1.7, marginTop: 12, padding: "12px 14px", backgroundColor: activeTheme.calmTint, borderLeft: `2px solid ${activeTheme.calm}`, borderRadius: 2, fontStyle: "italic" }}>{p.guidance}</div>}
                 </div>
               ))}
             </div>
@@ -2545,11 +2908,11 @@ function HRCoach() {
               {monthKeys.map(mk => {
                 const r = monthReports[mk];
                 const health = (r.avgRecovery || 50) - (r.avgStress || 50) * 0.4;
-                const bg = health > 30 ? "#e8f0e4" : health > 10 ? "#f5f0e6" : "#f5e6e4";
-                const border = health > 30 ? "#5a8a64" : health > 10 ? "#c4a43a" : "#c47a3a";
+                const dot = health > 30 ? activeTheme.calm : health > 10 ? activeTheme.gold : activeTheme.warm;
                 return (
                   <button key={mk} onClick={() => { setSelectedMonth(mk); setCurrentView("month"); }}
-                    style={{ ...S.monthBtn, backgroundColor: bg, borderColor: border }}>
+                    style={{ ...S.monthBtn, display: "inline-flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", backgroundColor: dot, flexShrink: 0 }} />
                     {fmtMonth(mk)}
                   </button>
                 );
@@ -2627,7 +2990,10 @@ function HRCoach() {
       <div style={S.shell}>
         <div style={S.report}>
           <div style={S.header}>
-            <button style={S.btnGhost} onClick={() => setCurrentView("overview")}>← Overview</button>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 4 }}>
+              <button style={S.btnGhost} onClick={() => setCurrentView("overview")}>← Overview</button>
+              <ThemeToggle themeName={themeName} setThemeName={setThemeName} />
+            </div>
             <h1 style={S.title}>{fmtMonth(selectedMonth)}</h1>
             <div style={S.meta}>{valid.length} days of data · Data quality: {report.dataQualitySummary?.label || "n/a"} ({report.dataQualitySummary?.sufficientNightPct ?? 0}% sufficient nights)</div>
           </div>
@@ -2636,7 +3002,7 @@ function HRCoach() {
             <div style={S.cardLabel}>Monthly resting HR</div>
             <p style={S.coachText}>{report.summary}</p>
             {report.monthComparison && (
-              <p style={{ fontSize: 13, color: report.monthComparison.improving ? "#5a8a64" : "#b07040", marginTop: 8, fontStyle: "italic" }}>
+              <p style={{ fontSize: 13, color: report.monthComparison.improving ? activeTheme.calm : activeTheme.warm, marginTop: 8, fontStyle: "italic" }}>
                 vs {report.monthComparison.prevMonth}: {report.monthComparison.changes}
               </p>
             )}
@@ -2663,7 +3029,7 @@ function HRCoach() {
               if (v === null || v === undefined) return null;
               const sign = v > 0 ? "+" : "";
               const good = inverse ? v < 0 : v > 0;
-              return { text: `${sign}${Math.round(v)}`, color: Math.abs(v) < 2 ? "#8a8070" : good ? "#5a8a64" : "#c45a3a" };
+              return { text: `${sign}${Math.round(v)}`, color: Math.abs(v) < 2 ? activeTheme.faint : good ? activeTheme.calm : activeTheme.warm };
             };
             const metrics = [
               { label: "Recovery", val: fmt(mc.recDiff, false) },
@@ -2677,17 +3043,17 @@ function HRCoach() {
                 <div style={{ display: "grid", gridTemplateColumns: `repeat(${metrics.length}, 1fr)`, gap: 12, marginBottom: mc.driverDeltas.length > 0 ? 16 : 0 }}>
                   {metrics.map((m, i) => (
                     <div key={i} style={{ textAlign: "center" }}>
-                      <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: 24, color: m.val.color, lineHeight: 1 }}>{m.val.text}</div>
-                      <div style={{ fontSize: 11, color: "#a09888", marginTop: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>{m.label}</div>
+                      <div style={{ fontFamily: "'Newsreader', serif", fontSize: 24, color: m.val.color, lineHeight: 1 }}>{m.val.text}</div>
+                      <div style={{ fontSize: 11, color: activeTheme.faint, marginTop: 6, textTransform: "uppercase", letterSpacing: "0.16em", fontWeight: 600 }}>{m.label}</div>
                     </div>
                   ))}
                 </div>
                 {mc.driverDeltas.length > 0 && (
                   <div style={{ borderTop: "1px solid #f0ece4", paddingTop: 12 }}>
                     {mc.driverDeltas.map((d, i) => (
-                      <div key={i} style={{ fontSize: 13, color: "#4a4540", display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: i < mc.driverDeltas.length - 1 ? "1px solid #f8f4ee" : "none" }}>
+                      <div key={i} style={{ fontSize: 13, color: activeTheme.ink, display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: i < mc.driverDeltas.length - 1 ? `1px solid ${activeTheme.hair}` : "none" }}>
                         <span>{dl(d.k)}</span>
-                        <span style={{ fontWeight: 600, color: d.delta > 0 ? "#c45a3a" : "#5a8a64" }}>{d.delta > 0 ? "↑" : "↓"} {Math.abs(d.delta)} days</span>
+                        <span style={{ fontWeight: 600, color: d.delta > 0 ? activeTheme.warm : activeTheme.calm }}>{d.delta > 0 ? "↑" : "↓"} {Math.abs(d.delta)} days</span>
                       </div>
                     ))}
                   </div>
@@ -2703,24 +3069,24 @@ function HRCoach() {
               <div style={S.card}>
                 <div style={S.cardLabel}>Weekly breakdown</div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-                  <div style={{ padding: "12px 14px", backgroundColor: "#f0f6ee", borderRadius: 8, borderLeft: "3px solid #5a8a64" }}>
-                    <div style={{ fontSize: 10, color: "#5a8a64", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 4 }}>Best week</div>
-                    <div style={{ fontSize: 12, color: "#3a5a3a", fontWeight: 500, marginBottom: 4 }}>w/c {wf.best.label}</div>
-                    <div style={{ fontSize: 12, color: "#6a8a6a" }}>Rec {wf.best.avgRec} · Stress {wf.best.avgStr}</div>
-                    {wf.best.workouts > 0 && <div style={{ fontSize: 11, color: "#7a9a8a", marginTop: 2 }}>{wf.best.workouts} workout{wf.best.workouts > 1 ? "s" : ""}</div>}
+                  <div style={{ padding: "14px 16px", backgroundColor: activeTheme.calmTint, borderRadius: 3, borderLeft: `2px solid ${activeTheme.calm}` }}>
+                    <div style={{ fontSize: 10, color: activeTheme.calmInk, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 6 }}>Best week</div>
+                    <div style={{ fontSize: 13, color: activeTheme.calmInk, fontWeight: 600, marginBottom: 4 }}>w/c {wf.best.label}</div>
+                    <div style={{ fontSize: 12, color: activeTheme.soft }}>Rec {wf.best.avgRec} · Stress {wf.best.avgStr}</div>
+                    {wf.best.workouts > 0 && <div style={{ fontSize: 11, color: activeTheme.faint, marginTop: 4 }}>{wf.best.workouts} workout{wf.best.workouts > 1 ? "s" : ""}</div>}
                   </div>
-                  <div style={{ padding: "12px 14px", backgroundColor: "#f8f0ec", borderRadius: 8, borderLeft: "3px solid #c47a3a" }}>
-                    <div style={{ fontSize: 10, color: "#c47a3a", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 4 }}>Toughest week</div>
-                    <div style={{ fontSize: 12, color: "#8a4a2a", fontWeight: 500, marginBottom: 4 }}>w/c {wf.tough.label}</div>
-                    <div style={{ fontSize: 12, color: "#aa7a5a" }}>Rec {wf.tough.avgRec} · Stress {wf.tough.avgStr}</div>
-                    {wf.tough.workouts > 0 && <div style={{ fontSize: 11, color: "#c49a7a", marginTop: 2 }}>{wf.tough.workouts} workout{wf.tough.workouts > 1 ? "s" : ""}</div>}
+                  <div style={{ padding: "14px 16px", backgroundColor: activeTheme.warmTint, borderRadius: 3, borderLeft: `2px solid ${activeTheme.warm}` }}>
+                    <div style={{ fontSize: 10, color: activeTheme.warmInk, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 6 }}>Toughest week</div>
+                    <div style={{ fontSize: 13, color: activeTheme.warmInk, fontWeight: 600, marginBottom: 4 }}>w/c {wf.tough.label}</div>
+                    <div style={{ fontSize: 12, color: activeTheme.soft }}>Rec {wf.tough.avgRec} · Stress {wf.tough.avgStr}</div>
+                    {wf.tough.workouts > 0 && <div style={{ fontSize: 11, color: activeTheme.faint, marginTop: 4 }}>{wf.tough.workouts} workout{wf.tough.workouts > 1 ? "s" : ""}</div>}
                   </div>
                 </div>
                 {wf.focusRec && (
-                  <div style={{ padding: "12px 14px", backgroundColor: "#f5f2ec", borderRadius: 8, borderLeft: "3px solid #a09060" }}>
-                    <div style={{ fontSize: 10, color: "#8a7040", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 6 }}>Consider focusing on next week</div>
-                    <div style={{ fontSize: 14, color: "#3a3228", lineHeight: 1.55 }}>{wf.focusRec}</div>
-                    <div style={{ fontSize: 11, color: "#a09070", marginTop: 4, fontStyle: "italic" }}>Based on: {wf.focusReason}</div>
+                  <div style={{ padding: "14px 16px", backgroundColor: activeTheme.goldTint, borderRadius: 3, borderLeft: `2px solid ${activeTheme.gold}` }}>
+                    <div style={{ fontSize: 10, color: activeTheme.goldInk, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 8 }}>Consider focusing on next week</div>
+                    <div style={{ fontSize: 14.5, color: activeTheme.ink, lineHeight: 1.6 }}>{wf.focusRec}</div>
+                    <div style={{ fontSize: 11, color: activeTheme.faint, marginTop: 6, fontStyle: "italic" }}>Based on: {wf.focusReason}</div>
                   </div>
                 )}
               </div>
@@ -2732,8 +3098,8 @@ function HRCoach() {
               <p style={S.cardSub}>Your month, summarised into key disruptors, wins, and changes.</p>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {report.notes.filter(n => n.icon === "◎" || n.icon === "✦" || n.icon === "⇄" || n.icon === "▦").slice(0, 4).map((n, i) => (
-                  <div key={i} style={{ fontSize: 14, color: "#4a4540", lineHeight: 1.6, padding: "10px 12px", backgroundColor: "#fbfaf7", borderRadius: 8, border: "1px solid #eee8dc" }}>
-                    <span style={{ marginRight: 10, color: "#8a7a60" }}>{n.icon}</span>
+                  <div key={i} style={{ fontSize: 14, color: activeTheme.ink, lineHeight: 1.65, padding: "12px 14px", backgroundColor: activeTheme.paperAlt, borderRadius: 3, borderLeft: `1px solid ${activeTheme.hair}` }}>
+                    <span style={{ marginRight: 12, color: activeTheme.gold, fontFamily: "'Newsreader', serif" }}>{n.icon}</span>
                     {n.text}
                   </div>
                 ))}
@@ -2742,9 +3108,9 @@ function HRCoach() {
 
             {/* Priority recommendation */}
           {report.priority && (
-            <div style={{ ...S.card, backgroundColor: "#f4f7f2", borderColor: "#c8d8c4" }}>
-              <div style={{ ...S.cardLabel, color: "#5a7a5a" }}>This month's priority: {report.priority.label}{report.priority.confidence ? ` · ${report.priority.confidence} confidence` : ""}</div>
-              <p style={{ ...S.coachText, color: "#3a5a3a" }}>{report.priority.text}</p>
+            <div style={{ ...S.card, backgroundColor: activeTheme.calmTint, padding: "28px 24px", borderTop: `2px solid ${activeTheme.calm}`, borderRadius: 3 }}>
+              <div style={{ ...S.cardLabel, color: activeTheme.calmInk }}>This month's priority · {report.priority.label}{report.priority.confidence ? ` · ${report.priority.confidence} confidence` : ""}</div>
+              <p style={{ ...S.coachText, color: activeTheme.calmInk }}>{report.priority.text}</p>
             </div>
           )}
 
@@ -2759,17 +3125,16 @@ function HRCoach() {
 
           <div style={S.card}>
             <div style={S.cardLabel}>This month's signals</div>
-            <GridHeatmap signals={valid} field="recoveryQuality" label="Recovery Quality" isInverse={false} />
-            <GridHeatmap signals={valid} field="stressSignature" label="Stress Signature" isInverse={true} />
-            <GridHeatmap signals={valid} field="recoveryDebt" label="Recovery Debt" isInverse={true} />
-            <GridHeatmap signals={valid} field="cardioEfficiency" label="Cardiovascular Efficiency" isInverse={false} />
-            <GridHeatmap signals={valid} field="autonomicLoad" label="Autonomic Load" isInverse={true} />
-            <GridHeatmap signals={valid} field="pulseStability" label="Pulse Stability (overnight rhythm)" isInverse={false} />
-            <div style={{ fontSize: 12, color: activeTheme.faint, marginTop: -4 }}>
-              Based on HR reading variation, not inter-beat HRV. Use as a trend indicator only.
+            <p style={S.cardSub}>Each day is one cell, with six bands stacked top to bottom — one per signal. Scan a column to see day-of-week patterns; scan a row to spot days where everything moved together. Click a band tag to blow that signal up below.</p>
+            <CorrelationChips valid={valid} signals={MONTH_SIGNAL_METRICS} />
+            <RibbonCalendar valid={valid} signals={MONTH_SIGNAL_METRICS} expandedField={expandedSignal} onExpand={setExpandedSignal} />
+            <div style={{ fontSize: 12, color: activeTheme.faint, marginTop: 14, lineHeight: 1.5 }}>
+              Pulse stability is based on HR reading variation, not inter-beat HRV. Use as a trend indicator only.
             </div>
             {valid.some(d => d.acwr !== null) && (
-              <GridHeatmap signals={valid.map(d => ({ ...d, acwrDisplay: d.acwr !== null ? Math.round(d.acwr * 100) : null }))} field="acwrDisplay" label="Workload Ratio (ACWR ×100)" isInverse={false} />
+              <div style={{ marginTop: 22, paddingTop: 18, borderTop: `1px solid ${activeTheme.hair}` }}>
+                <GridHeatmap signals={valid.map(d => ({ ...d, acwrDisplay: d.acwr !== null ? Math.round(d.acwr * 100) : null }))} field="acwrDisplay" label="Workload Ratio (ACWR ×100)" isInverse={false} />
+              </div>
             )}
           </div>
           {valid.length > 0 && lowConfidenceDays / valid.length > 0.3 && (
@@ -2796,7 +3161,7 @@ function HRCoach() {
             <div style={S.card}>
               <div style={S.cardLabel}>What to try</div>
               {report.guidance.map((g, i) => (
-                <div key={i} style={{ fontSize: 14, color: "#4a5a4a", lineHeight: 1.65, padding: "10px 14px", backgroundColor: "#f4f7f2", borderRadius: 6, marginBottom: 8, borderLeft: "3px solid #8aaa7a" }}>
+                <div key={i} style={{ fontSize: 14.5, color: activeTheme.calmInk, lineHeight: 1.7, padding: "12px 16px", backgroundColor: activeTheme.calmTint, borderRadius: 2, marginBottom: 8, borderLeft: `2px solid ${activeTheme.calm}` }}>
                   {g}
                 </div>
               ))}
@@ -2809,15 +3174,15 @@ function HRCoach() {
               <div style={S.cardLabel}>Day highlights</div>
               {report.callouts.map((c, i) => (
                 <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 8 }}>
-                  <div style={{ padding: "12px 14px", backgroundColor: "#f0f6ee", borderRadius: 8, borderLeft: "3px solid #5a8a64" }}>
-                    <div style={{ fontSize: 11, color: "#5a8a64", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 4 }}>Best day</div>
-                    <div style={{ fontSize: 13, color: "#3a5a3a", fontWeight: 500 }}>{c.best.date}</div>
-                    <div style={{ fontSize: 12, color: "#6a8a6a" }}>Recovery {c.best.recovery} · Stress {c.best.stress}</div>
+                  <div style={{ padding: "14px 16px", backgroundColor: activeTheme.calmTint, borderRadius: 3, borderLeft: `2px solid ${activeTheme.calm}` }}>
+                    <div style={{ fontSize: 10, color: activeTheme.calmInk, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 6 }}>Best day</div>
+                    <div style={{ fontSize: 14, color: activeTheme.calmInk, fontWeight: 600 }}>{c.best.date}</div>
+                    <div style={{ fontSize: 12, color: activeTheme.soft, marginTop: 3 }}>Recovery {c.best.recovery} · Stress {c.best.stress}</div>
                   </div>
-                  <div style={{ padding: "12px 14px", backgroundColor: "#f8f0ec", borderRadius: 8, borderLeft: "3px solid #c47a3a" }}>
-                    <div style={{ fontSize: 11, color: "#c47a3a", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 600, marginBottom: 4 }}>Hardest day</div>
-                    <div style={{ fontSize: 13, color: "#8a4a2a", fontWeight: 500 }}>{c.worst.date}</div>
-                    <div style={{ fontSize: 12, color: "#aa7a5a" }}>Recovery {c.worst.recovery} · Stress {c.worst.stress}</div>
+                  <div style={{ padding: "14px 16px", backgroundColor: activeTheme.warmTint, borderRadius: 3, borderLeft: `2px solid ${activeTheme.warm}` }}>
+                    <div style={{ fontSize: 10, color: activeTheme.warmInk, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 6 }}>Hardest day</div>
+                    <div style={{ fontSize: 14, color: activeTheme.warmInk, fontWeight: 600 }}>{c.worst.date}</div>
+                    <div style={{ fontSize: 12, color: activeTheme.soft, marginTop: 3 }}>Recovery {c.worst.recovery} · Stress {c.worst.stress}</div>
                   </div>
                 </div>
               ))}
@@ -2848,14 +3213,14 @@ function HRCoach() {
               </div>
               {valid.map((d, i) => {
                 const dayLabel = new Date(d.date).toLocaleDateString("en-GB", { weekday: "short", day: "numeric" });
-                const recColor = d.recoveryQuality > 60 ? "#5a8a64" : d.recoveryQuality < 40 ? "#c45a3a" : "#a09060";
-                const stressColor = d.stressSignature > 60 ? "#c45a3a" : d.stressSignature < 35 ? "#5a8a64" : "#a09060";
+                const recColor = d.recoveryQuality > 60 ? activeTheme.calm : d.recoveryQuality < 40 ? activeTheme.warm : activeTheme.gold;
+                const stressColor = d.stressSignature > 60 ? activeTheme.warm : d.stressSignature < 35 ? activeTheme.calm : activeTheme.gold;
                 const actLabel = d.activityLevel === "workout" ? "workout" : d.activityLevel === "moderate" ? "moderate" : d.activityLevel === "light" ? "light" : "";
                 const actColor = d.activityLevel === "workout" ? "#7a5aaa" : d.activityLevel === "moderate" ? "#5a7aaa" : d.activityLevel === "light" ? "#7a9a8a" : "#a09888";
                 return (
                   <div key={i} style={{ ...S.dayRow, cursor: "pointer" }} onClick={() => setSelectedDay(d.date)}>
-                    <span style={{ color: "#4a4540" }}>{dayLabel}</span>
-                    <span style={{ color: "#6a6055", textAlign: "center" }}>{d.dayMeanHR}</span>
+                    <span style={{ color: activeTheme.ink }}>{dayLabel}</span>
+                    <span style={{ color: activeTheme.soft, textAlign: "center", fontVariantNumeric: "tabular-nums" }}>{d.dayMeanHR}</span>
                     <span style={{ fontSize: 14, textAlign: "center", color: recColor }}>●</span>
                     <span style={{ fontSize: 14, textAlign: "center", color: stressColor }}>●</span>
                     <span style={{ fontSize: 12, color: actColor, fontStyle: "italic" }}>
@@ -2882,7 +3247,7 @@ function HRCoach() {
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
             {monthKeys.map(mk => (
               <button key={mk} onClick={() => setSelectedMonth(mk)}
-                style={{ ...S.monthBtn, backgroundColor: mk === selectedMonth ? "#3a3228" : "#f5f0e8", color: mk === selectedMonth ? "#f5f0e8" : "#3a3228", borderColor: mk === selectedMonth ? "#3a3228" : "#d0c8b8" }}>
+                style={{ ...S.monthBtn, backgroundColor: mk === selectedMonth ? activeTheme.ink : activeTheme.card, color: mk === selectedMonth ? activeTheme.paper : activeTheme.ink, borderColor: mk === selectedMonth ? activeTheme.ink : activeTheme.rule }}>
                 {fmtMonth(mk)}
               </button>
             ))}
@@ -2908,40 +3273,57 @@ function HRCoach() {
 
 function getStyles(T) {
   return {
-    shell: { minHeight: "100vh", backgroundColor: T.paper, fontFamily: "'DM Sans', sans-serif", color: T.ink, lineHeight: 1.6, overflowX: "hidden" },
-    importWrap: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", padding: "24px 16px" },
-    importInner: { maxWidth: 600, width: "100%" },
-    eyebrow: { fontSize: 12, color: T.faint, letterSpacing: "0.15em", textTransform: "uppercase", fontWeight: 500, marginBottom: 4 },
-    importTitle: { fontFamily: "'Instrument Serif', serif", fontSize: 28, fontWeight: 400, lineHeight: 1.15, margin: "0 0 14px", color: T.ink },
-    importSub: { fontSize: 15, color: T.soft, marginBottom: 24, maxWidth: 520 },
-    textarea: { width: "100%", minHeight: 180, padding: 16, fontSize: 13, fontFamily: "'DM Mono', 'SF Mono', monospace", backgroundColor: T.card, border: `1px solid ${T.hair}`, borderRadius: 8, resize: "vertical", color: T.ink, outline: "none", boxSizing: "border-box" },
-    btnPrimary: { padding: "12px 28px", fontSize: 14, fontWeight: 600, backgroundColor: T.ink, color: T.paper, border: "none", borderRadius: 6, cursor: "pointer", fontFamily: "'DM Sans', sans-serif" },
-    btnGhost: { background: "none", border: `1px solid ${T.hair}`, color: T.soft, cursor: "pointer", fontSize: 13, fontFamily: "'DM Sans', sans-serif", padding: "6px 14px", borderRadius: 5 },
-    fmtNote: { marginTop: 20, fontSize: 12, color: T.faint },
-    code: { backgroundColor: T.paper, padding: "2px 6px", borderRadius: 3, fontSize: 11, fontFamily: "'DM Mono', 'SF Mono', monospace" },
-    report: { maxWidth: 720, margin: "0 auto", padding: "24px 12px 60px" },
-    header: { marginBottom: 32 },
-    title: { fontFamily: "'Instrument Serif', serif", fontSize: 26, fontWeight: 400, lineHeight: 1.15, margin: "8px 0 4px", color: T.ink },
-    meta: { fontSize: 13, color: T.faint },
-    card: { backgroundColor: T.card, borderRadius: 10, padding: "20px 16px", marginBottom: 16, border: `1px solid ${T.hair}` },
-    cardLabel: { fontSize: 11, color: T.faint, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 },
-    cardSub: { fontSize: 13, color: T.soft, marginTop: 0, marginBottom: 16 },
-    baseGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 20, marginBottom: 16 },
-    baseStat: { textAlign: "center" },
-    bigNum: { fontFamily: "'Instrument Serif', serif", fontSize: 32, fontWeight: 400, color: T.ink, lineHeight: 1 },
-    statLabel: { fontSize: 12, color: T.faint, marginTop: 4 },
-    baseNote: { fontSize: 13, color: T.soft, fontStyle: "italic", marginBottom: 0, marginTop: 8 },
-    insight: { borderLeft: `3px solid ${T.hair}`, paddingLeft: 16, marginBottom: 20, marginTop: 16 },
-    insightTitle: { fontSize: 16, fontWeight: 600, color: T.ink, marginBottom: 4, fontFamily: "'Instrument Serif', serif" },
-    insightBody: { fontSize: 14, color: T.soft, lineHeight: 1.65 },
-    coachText: { fontSize: 15, color: T.ink, lineHeight: 1.7, margin: "8px 0 0" },
-    coachNote: { display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 16, marginTop: 12 },
-    coachIcon: { fontSize: 16, color: T.soft, flexShrink: 0, marginTop: 2 },
+    shell: { minHeight: "100vh", backgroundColor: T.paper, fontFamily: "'DM Sans', sans-serif", color: T.ink, lineHeight: 1.55, overflowX: "hidden", fontFeatureSettings: "'ss01'" },
+
+    // ─── Import view ────────────────────────────────────────────────────
+    importWrap: { display: "flex", justifyContent: "center", alignItems: "flex-start", minHeight: "100vh", padding: "min(10vh, 80px) 24px 60px", backgroundColor: T.paper },
+    importInner: { maxWidth: 580, width: "100%" },
+
+    eyebrow: { fontSize: 10.5, color: T.faint, letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 600, marginBottom: 22, display: "block" },
+
+    importTitle: { fontFamily: "'Newsreader', serif", fontSize: "clamp(40px, 7vw, 60px)", fontWeight: 400, lineHeight: 0.98, margin: "0 0 22px", color: T.ink, letterSpacing: "-0.015em", textWrap: "balance" },
+    importSub: { fontSize: 16, color: T.soft, marginBottom: 40, maxWidth: 460, lineHeight: 1.55 },
+
+    textarea: { width: "100%", minHeight: 180, padding: 16, fontSize: 13, fontFamily: "'JetBrains Mono', 'DM Mono', 'SF Mono', monospace", backgroundColor: T.card, border: `1px solid ${T.hair}`, borderRadius: 3, resize: "vertical", color: T.ink, outline: "none", boxSizing: "border-box", lineHeight: 1.5 },
+
+    btnPrimary: { padding: "13px 26px", fontSize: 12, fontWeight: 600, backgroundColor: T.ink, color: T.paper, border: "none", borderRadius: 3, cursor: "pointer", fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.08em", textTransform: "uppercase" },
+    btnGhost: { background: "transparent", border: `1px solid ${T.rule}`, color: T.ink, cursor: "pointer", fontSize: 11, fontWeight: 600, fontFamily: "'DM Sans', sans-serif", padding: "9px 14px", borderRadius: 3, letterSpacing: "0.1em", textTransform: "uppercase" },
+
+    fmtNote: { marginTop: 26, fontSize: 12, color: T.faint, lineHeight: 1.55 },
+    code: { backgroundColor: T.paperAlt, padding: "2px 6px", borderRadius: 2, fontSize: 11.5, fontFamily: "'JetBrains Mono', 'DM Mono', 'SF Mono', monospace", color: T.ink },
+
+    // ─── Report layout ──────────────────────────────────────────────────
+    report: { maxWidth: 880, margin: "0 auto", padding: "44px 28px 80px" },
+    header: { marginBottom: 44, paddingBottom: 28, borderBottom: `1px solid ${T.rule}` },
+    title: { fontFamily: "'Newsreader', serif", fontSize: "clamp(40px, 6.5vw, 58px)", fontWeight: 400, lineHeight: 1.0, margin: "10px 0 14px", color: T.ink, letterSpacing: "-0.018em", textWrap: "balance" },
+    meta: { fontSize: 12, color: T.soft, letterSpacing: "0.04em", fontFamily: "'DM Sans', sans-serif" },
+
+    // "Card" is now a hairlined section, not a rounded box. Keeps the API.
+    card: { backgroundColor: "transparent", borderRadius: 0, padding: "32px 0 0", marginBottom: 36, borderTop: `1px solid ${T.hair}`, border: "none", borderTopWidth: 1, borderTopStyle: "solid", borderTopColor: T.hair },
+    cardLabel: { fontSize: 10.5, color: T.ink, letterSpacing: "0.22em", textTransform: "uppercase", fontWeight: 700, marginBottom: 10 },
+    cardSub: { fontSize: 14, color: T.soft, marginTop: 0, marginBottom: 20, maxWidth: 640, lineHeight: 1.6 },
+
+    // Hero stats — a grid of inset tiles separated by hairlines, not floating cards
+    baseGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 1, marginBottom: 14, backgroundColor: T.hair, border: `1px solid ${T.hair}`, borderRadius: 2 },
+    baseStat: { textAlign: "left", padding: "22px 20px 20px", backgroundColor: T.card },
+    bigNum: { fontFamily: "'Newsreader', serif", fontSize: 56, fontWeight: 400, color: T.ink, lineHeight: 0.92, letterSpacing: "-0.025em", fontFeatureSettings: "'tnum'" },
+    statLabel: { fontSize: 10.5, color: T.faint, marginTop: 12, letterSpacing: "0.14em", textTransform: "uppercase", fontWeight: 600 },
+    baseNote: { fontSize: 12.5, color: T.faint, fontStyle: "italic", marginBottom: 0, marginTop: 14, maxWidth: 620, lineHeight: 1.6 },
+
+    insight: { borderLeft: `2px solid ${T.rule}`, paddingLeft: 18, marginBottom: 26, marginTop: 18 },
+    insightTitle: { fontSize: 22, fontWeight: 400, color: T.ink, marginBottom: 8, fontFamily: "'Newsreader', serif", lineHeight: 1.15, letterSpacing: "-0.01em" },
+    insightBody: { fontSize: 15, color: T.soft, lineHeight: 1.7 },
+
+    coachText: { fontSize: 17, color: T.ink, lineHeight: 1.7, margin: "8px 0 0", maxWidth: 680, fontFamily: "'Newsreader', serif", fontWeight: 400, letterSpacing: "0.005em" },
+    coachNote: { display: "flex", gap: 16, alignItems: "flex-start", marginBottom: 0, marginTop: 0, paddingTop: 12, paddingBottom: 12, borderTop: `1px solid ${T.hair}` },
+    coachIcon: { fontSize: 16, color: T.faint, flexShrink: 0, marginTop: 1, width: 18, fontFamily: "'Newsreader', serif" },
     coachNoteText: { fontSize: 14, color: T.soft, lineHeight: 1.65 },
-    monthBtn: { padding: "8px 16px", fontSize: 13, fontWeight: 500, borderRadius: 6, cursor: "pointer", border: `1px solid ${T.hair}`, fontFamily: "'DM Sans', sans-serif", backgroundColor: T.paper, color: T.ink, transition: "all 0.15s ease" },
-    dayGrid: { fontSize: 13, marginTop: 12 },
-    dayGridH: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, fontWeight: 600, color: T.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: `1px solid ${T.hair}`, paddingBottom: 8, marginBottom: 4 },
-    dayRow: { display: "grid", gridTemplateColumns: "minmax(55px,80px) minmax(40px,60px) 36px 36px 1fr", gap: 4, padding: "5px 0", borderBottom: `1px solid ${T.paper}`, alignItems: "center" },
+
+    monthBtn: { padding: "10px 16px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer", border: `1px solid ${T.rule}`, fontFamily: "'DM Sans', sans-serif", backgroundColor: T.card, color: T.ink, transition: "all 0.15s ease", letterSpacing: "0.12em", textTransform: "uppercase" },
+
+    dayGrid: { fontSize: 13, marginTop: 8 },
+    dayGridH: { display: "grid", gridTemplateColumns: "minmax(70px,110px) minmax(40px,60px) 32px 32px 1fr", gap: 12, fontWeight: 700, color: T.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.16em", borderBottom: `1px solid ${T.rule}`, paddingBottom: 10, marginBottom: 0 },
+    dayRow: { display: "grid", gridTemplateColumns: "minmax(70px,110px) minmax(40px,60px) 32px 32px 1fr", gap: 12, padding: "11px 0", borderBottom: `1px solid ${T.hair}`, alignItems: "center" },
   };
 }
 
