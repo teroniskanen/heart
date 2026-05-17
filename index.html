@@ -65,6 +65,16 @@ const RISING_BASELINE_BPM = 5;          // rising_baseline: 7d vs 28d night HR d
 const MIN_NIGHT_COV_FOR_TAGS = 60;      // minimum coverageNight% for night-window tags to fire
 const MIN_MORNING_COV_FOR_TAGS = 40;    // minimum coverageMorning% for wake-window tags to fire
 const MIN_DAY_COV_FOR_TAGS = 60;        // minimum coverageDay% for daytime tags to fire
+
+// Calibration — absolute physiological floors for two-condition triggers
+// A tag requires BOTH: reading beyond its personal percentile AND beyond this floor.
+// Prevents firing on physiologically-OK days that happen to be a user's worst.
+const CALIB_MIN_DAYS = 21;             // qualifying nights required before personal thresholds activate
+const SHALLOW_NADIR_ABS_FLOOR = 5;     // shallow_nadir: nadirDepth must be < 5 bpm (not just a personal low)
+const HIGH_WAKE_SPIKE_ABS_FLOOR = 20;  // high_wake_spike: wakeSpike must exceed 20 bpm
+const HIGH_IDLE_STRESS_ABS_FLOOR = 20; // high_idle_stress: idleStressMinutes must exceed 20 min
+const HIGH_NIGHT_VOL_ABS_FLOOR = 5;    // high_night_volatility: nightVolatilityPercent must exceed 5%
+const LOW_PULSE_STAB_ABS_FLOOR = 65;   // low_pulse_stability: pulseStability must be below 65
 const STORAGE_KEYS = {
   analysis: "hrc-analysis",
   raw: "hrc-raw",
@@ -846,7 +856,7 @@ function computeScoresFromRaw(rawMetrics, baseline, readings, activityLevel) {
   };
 }
 
-function computeDriversFromDay(day) {
+function computeDriversFromDay(day, thresholds = null) {
   const raw = day.rawMetrics || {};
   const drivers = [];
 
@@ -864,20 +874,28 @@ function computeDriversFromDay(day) {
     if (raw.nightMeanHR !== null && raw.nightMeanHR > raw.dynamicBaseline + elevatedThreshold)
       drivers.push("elevated_night_hr");
     if (raw.nadirHour !== null && raw.nadirHour > 5) drivers.push("late_nadir");
-    // shallow_nadir tag held — metric stored as nadirDepth, calibrate SHALLOW_NADIR_BPM before enabling:
-    // if (raw.nadirDepth !== null && raw.nadirDepth < SHALLOW_NADIR_BPM) drivers.push("shallow_nadir");
-    if (raw.nightVolatilityPercent !== null && raw.nightVolatilityPercent > 8) drivers.push("high_night_volatility");
-    if (day.pulseStability !== null && day.pulseStability < 50) drivers.push("low_pulse_stability");
+    // shallow_nadir: enabled when calibrated (two-condition: abs floor + personal P20)
+    if (raw.nadirDepth !== null) {
+      const nadirThr = thresholds?.shallowNadirThreshold ?? SHALLOW_NADIR_BPM;
+      if (raw.nadirDepth < nadirThr) drivers.push("shallow_nadir");
+    }
+    const nightVolThr = thresholds?.highNightVolThreshold ?? 8;
+    if (raw.nightVolatilityPercent !== null && raw.nightVolatilityPercent > nightVolThr) drivers.push("high_night_volatility");
+    const pulseStabThr = thresholds?.lowPulseStabThreshold ?? 50;
+    if (day.pulseStability !== null && day.pulseStability < pulseStabThr) drivers.push("low_pulse_stability");
     if (raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5) drivers.push("good_nadir");
-    if (day.pulseStability !== null && day.pulseStability >= 70) drivers.push("stable_pulse");
+    const stablePulseThr = thresholds ? (thresholds.lowPulseStabThreshold + 15) : 70;
+    if (day.pulseStability !== null && day.pulseStability >= stablePulseThr) drivers.push("stable_pulse");
     // mid_sleep_arousal tag held — metric stored, validate sample density before enabling:
     // if (raw.midSleepArousal === true) drivers.push("mid_sleep_arousal");
   }
 
   // Morning/wake-window tags
   if (morningOk) {
-    if (raw.wakeSpike !== null && raw.wakeSpike > 30) drivers.push("high_wake_spike");
-    if (raw.wakeSpike !== null && raw.wakeSpike <= 25) drivers.push("smooth_wake");
+    const wakeThr = thresholds?.highWakeSpikeThreshold ?? 30;
+    if (raw.wakeSpike !== null && raw.wakeSpike > wakeThr) drivers.push("high_wake_spike");
+    const smoothWakeThr = thresholds ? (thresholds.highWakeSpikeThreshold - 5) : 25;
+    if (raw.wakeSpike !== null && raw.wakeSpike <= smoothWakeThr) drivers.push("smooth_wake");
   }
 
   // Evening tags (use normalized slope when available, fall back to raw)
@@ -891,7 +909,8 @@ function computeDriversFromDay(day) {
 
   // Daytime tags
   if (dayOk) {
-    if (raw.idleStressMinutes !== null && raw.idleStressMinutes > 45) drivers.push("high_idle_stress");
+    const idleThr = thresholds?.highIdleStressThreshold ?? 45;
+    if (raw.idleStressMinutes !== null && raw.idleStressMinutes > idleThr) drivers.push("high_idle_stress");
     if (raw.idleStressMinutes !== null && raw.idleStressMinutes <= 10) drivers.push("calm_day");
   }
 
@@ -909,6 +928,43 @@ function computeDriversFromDay(day) {
   if (raw.activityLevel === "workout" || raw.activityLevel === "moderate") drivers.push("hard_training_day");
 
   return drivers;
+}
+
+// Computes per-user magnitude thresholds from historical day records.
+// Returns null when fewer than CALIB_MIN_DAYS qualifying nights are available;
+// callers fall back to hardcoded defaults in that case.
+function computeUserThresholds(days) {
+  function pctile(arr, p) {
+    const sorted = [...arr].sort((a, b) => a - b);
+    return sorted[Math.max(0, Math.floor(sorted.length * p / 100) - 1)];
+  }
+
+  const calibDays = days.filter(d =>
+    !d.incomplete &&
+    d.rawMetrics?.hasNightData &&
+    (d.rawMetrics?.coverageNight ?? 0) >= MIN_NIGHT_COV_FOR_TAGS
+  );
+
+  if (calibDays.length < CALIB_MIN_DAYS) return null;
+
+  const nadirDepths     = calibDays.map(d => d.rawMetrics.nadirDepth).filter(v => v !== null && !isNaN(v));
+  const wakeSpikes      = calibDays.map(d => d.rawMetrics.wakeSpike).filter(v => v !== null && !isNaN(v));
+  const idleStressMins  = calibDays.map(d => d.rawMetrics.idleStressMinutes).filter(v => v !== null && !isNaN(v));
+  const nightVols       = calibDays.map(d => d.rawMetrics.nightVolatilityPercent).filter(v => v !== null && !isNaN(v));
+  const pulseStabs      = calibDays.map(d => d.pulseStability).filter(v => v !== null && !isNaN(v));
+
+  return {
+    calibrated: true,
+    daysUsed: calibDays.length,
+    // low = bad: fire when nadirDepth < threshold (worst personal P20, but never above abs floor)
+    shallowNadirThreshold:   nadirDepths.length    >= 10 ? Math.min(SHALLOW_NADIR_ABS_FLOOR,    pctile(nadirDepths,    20)) : SHALLOW_NADIR_BPM,
+    // high = bad: fire when value > threshold (worst personal P80, but never below abs floor)
+    highWakeSpikeThreshold:  wakeSpikes.length     >= 10 ? Math.max(HIGH_WAKE_SPIKE_ABS_FLOOR,  pctile(wakeSpikes,     80)) : 30,
+    highIdleStressThreshold: idleStressMins.length >= 10 ? Math.max(HIGH_IDLE_STRESS_ABS_FLOOR, pctile(idleStressMins, 80)) : 45,
+    highNightVolThreshold:   nightVols.length      >= 10 ? Math.max(HIGH_NIGHT_VOL_ABS_FLOOR,   pctile(nightVols,      80)) : 8,
+    // low = bad: fire when pulseStability < threshold (worst personal P20, but never above abs floor)
+    lowPulseStabThreshold:   pulseStabs.length     >= 10 ? Math.min(LOW_PULSE_STAB_ABS_FLOOR,   pctile(pulseStabs,     20)) : 50,
+  };
 }
 
 function buildDayRecord(date, rawMetrics, scores, drivers, coverageStats, currentRestingHR, incomplete = false) {
@@ -1328,12 +1384,22 @@ function computeDailySignals(days, baseline, maxHR) {
     }
   }
 
+  // Phase 2: recompute all drivers with calibrated per-user thresholds (if enough history)
+  const userThresholds = computeUserThresholds(dailySignals);
+  if (userThresholds) {
+    for (const day of dailySignals) {
+      if (!day.incomplete) {
+        day.drivers = computeDriversFromDay(day, userThresholds);
+      }
+    }
+  }
+
   attachRollingTrends(dailySignals);
   for (let i = 0; i < dailySignals.length; i++) {
     dailySignals[i].recommendations = generateDayRecommendations(dailySignals[i], dailySignals[i - 1] || null, { baseline });
   }
 
-  return dailySignals;
+  return { dailySignals, userThresholds };
 }
 
 function detectWorkoutRecovery(dailySignals, baseline) {
@@ -2806,7 +2872,7 @@ function HRCoach() {
         ? Math.round(208 - 0.7 * ageNum)
         : p99;
 
-      const dailySignals = computeDailySignals(days, baseline, maxHR);
+      const { dailySignals, userThresholds } = computeDailySignals(days, baseline, maxHR);
       const patterns = findPatterns(dailySignals, baseline);
       const recovery = detectWorkoutRecovery(dailySignals, baseline);
 
@@ -2827,7 +2893,7 @@ function HRCoach() {
       }
 
       const exportText = generateExportSummary(baseline, dailySignals, patterns, recovery, dataQuality);
-      const analysis = { baseline, dataQuality, dailySignals, patterns, recovery, months, monthKeys, monthReports, exportText, maxHR, rawReadingsByDate: days };
+      const analysis = { baseline, dataQuality, dailySignals, userThresholds, patterns, recovery, months, monthKeys, monthReports, exportText, maxHR, rawReadingsByDate: days };
 
       setResult(analysis);
       if (text.length <= RAW_PERSIST_LIMIT) {
@@ -2993,7 +3059,7 @@ function HRCoach() {
   }
 
   if (!result) return null;
-  const { baseline, dailySignals, patterns, recovery, monthKeys, monthReports, months, dataQuality, maxHR, rawReadingsByDate = {} } = result;
+  const { baseline, dailySignals, userThresholds, patterns, recovery, monthKeys, monthReports, months, dataQuality, maxHR, rawReadingsByDate = {} } = result;
   const validDays = dailySignals.filter(d => !d.incomplete);
   const dateRange = `${fmtDate(dailySignals[0].date)} – ${fmtDate(dailySignals[dailySignals.length - 1].date)}`;
   const lastValid = validDays[validDays.length - 1];
@@ -3033,6 +3099,12 @@ function HRCoach() {
               {dataQuality.incompleteDays > 0
                 ? ` ${dataQuality.incompleteDays} day${dataQuality.incompleteDays > 1 ? "s" : ""} had less than 80% coverage and ${dataQuality.incompleteDays > 1 ? "are" : "is"} excluded from signal analysis.`
                 : " All days had sufficient coverage for analysis."
+              }
+            </p>
+            <p style={{ ...S.cardSub, marginTop: 6 }}>
+              {userThresholds
+                ? `Signal thresholds personalised to your history (${userThresholds.daysUsed} nights).`
+                : `Signal thresholds using population defaults — ${Math.max(0, CALIB_MIN_DAYS - (dataQuality.validDays || 0))} more qualifying nights needed for personalised thresholds.`
               }
             </p>
           </div>
