@@ -316,13 +316,15 @@ function computeBaseline(days) {
 }
 
 function stdArr(arr) {
-  if (arr.length < 2) return 0;
-  const m = arr.reduce((s, v) => s + v, 0) / arr.length;
-  return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
+  const a = arr.filter(v => v !== null && v !== undefined);
+  if (a.length < 2) return 0;
+  const m = a.reduce((s, v) => s + v, 0) / a.length;
+  return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length);
 }
 
 function meanArr(arr) {
-  return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
+  const nonNull = arr.filter(v => v !== null && v !== undefined);
+  return nonNull.length ? nonNull.reduce((s, v) => s + v, 0) / nonNull.length : 0;
 }
 
 function weightedMean(arr, weightFn = () => 1) {
@@ -330,6 +332,7 @@ function weightedMean(arr, weightFn = () => 1) {
   let total = 0;
   let totalWeight = 0;
   for (const item of arr) {
+    if (item === null || item === undefined) continue;
     const weight = Math.max(0, weightFn(item) || 0);
     if (weight <= 0) continue;
     total += item * weight;
@@ -789,26 +792,31 @@ function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, cover
   };
 }
 
-function computeScoresFromRaw(rawMetrics, baseline, readings) {
-  let recoveryQuality = 50;
+function computeScoresFromRaw(rawMetrics, baseline, readings, activityLevel) {
+  let recoveryQuality = null;
   if (rawMetrics.hasNightData && rawMetrics.nightMeanHR !== null && rawMetrics.nightStdHR !== null) {
-    const depth = rawMetrics.dynamicBaseline - rawMetrics.nightMeanHR;
-    const stability = Math.max(0, 10 - rawMetrics.nightStdHR);
+    // depth capped at 15 bpm so extreme outliers don't waste headroom
+    const depth = Math.min(rawMetrics.dynamicBaseline - rawMetrics.nightMeanHR, 15);
+    // symmetric penalty/reward, capped at ±10 to limit artifact nights from dragging neighbors via smoothing
+    const stability = Math.max(-10, 10 - rawMetrics.nightStdHR);
     recoveryQuality = Math.min(100, Math.max(0, 50 + depth * 3 + stability * 2));
   }
 
-  let autonomicLoad = 25;
+  let autonomicLoad = null;
   if (rawMetrics.hasNightData && rawMetrics.nightMeanHR !== null && rawMetrics.nightStdHR !== null) {
     const elevation = rawMetrics.nightMeanHR - rawMetrics.dynamicBaseline;
-    const instability = rawMetrics.nightStdHR - baseline.std;
+    // use rolling EWMA std as reference instead of fixed initial-window baseline.std
+    const rollingStdRef = rawMetrics.nightHrEwmaStd ?? baseline.std;
+    const instability = rawMetrics.nightStdHR - rollingStdRef;
     autonomicLoad = Math.min(100, Math.max(0, 25 + elevation * 3 + instability * 4));
   }
 
-  const cardioEfficiency = rawMetrics.daytimeBelowBaselinePct !== null
+  const daytimeQuiescence = rawMetrics.daytimeBelowBaselinePct !== null
     ? Math.min(100, Math.max(0, rawMetrics.daytimeBelowBaselinePct))
-    : 50;
+    : null;
 
-  let stressSignature = 50;
+  const isActiveDay = activityLevel === "workout" || activityLevel === "moderate";
+  let stressSignature = null;
   const eveningReadings = readings.filter(r => r.hour >= 20 && r.hour <= 23);
   const earlyMorningReadings = readings.filter(r => r.hour >= 6 && r.hour <= 7);
   const hasEvening = sumCoveredMinutes(eveningReadings, 1, 5) >= 20;
@@ -816,18 +824,23 @@ function computeScoresFromRaw(rawMetrics, baseline, readings) {
   if (hasEvening || hasMorning) {
     const eveningElev = hasEvening ? meanArr(eveningReadings.map(r => r.bpm)) - rawMetrics.dynamicBaseline : 0;
     const morningElev = hasMorning ? meanArr(earlyMorningReadings.map(r => r.bpm)) - rawMetrics.dynamicBaseline : 0;
-    const weightedElev = hasEvening && hasMorning
-      ? eveningElev * 0.7 + morningElev * 0.3
-      : hasEvening ? eveningElev : morningElev;
-    stressSignature = Math.min(100, Math.max(0, 30 + weightedElev * 3));
+    // morning HR is the cleaner autonomic signal; evening confounded by recent activity
+    // on active days, suppress evening window entirely (exercise inflates it)
+    const useEvening = hasEvening && !isActiveDay;
+    const weightedElev = useEvening && hasMorning
+      ? eveningElev * 0.3 + morningElev * 0.7
+      : hasMorning ? morningElev : (useEvening ? eveningElev : null);
+    if (weightedElev !== null) {
+      stressSignature = Math.min(100, Math.max(0, 30 + weightedElev * 3));
+    }
   }
 
   return {
-    recoveryQuality: Math.round(recoveryQuality),
-    autonomicLoad: Math.round(autonomicLoad),
-    cardioEfficiency: Math.round(cardioEfficiency),
-    stressSignature: Math.round(stressSignature),
-    recoveryDebt: 30,
+    recoveryQuality: recoveryQuality !== null ? Math.round(recoveryQuality) : null,
+    autonomicLoad: autonomicLoad !== null ? Math.round(autonomicLoad) : null,
+    cardioEfficiency: daytimeQuiescence !== null ? Math.round(daytimeQuiescence) : null,
+    stressSignature: stressSignature !== null ? Math.round(stressSignature) : null,
+    recoveryDebt: null,
     pulseStability: rawMetrics.pulseStability,
     acwr: null,
   };
@@ -990,7 +1003,11 @@ function attachRollingTrends(days) {
     const win = days.slice(windowStart, i + 1).filter(d => !d.incomplete && d.nightMeanHR !== null && d.confidence !== "low");
     if (win.length >= 2) {
       const recentNightMean = weightedMean(win.map(d => d.nightMeanHR), (_, idx) => getCoverageWeight(win[idx]));
-      const drift = recentNightMean - days[i].dynamicBaseline;
+      // Use baseline as it stood before the 5-day window to prevent self-suppression:
+      // a sustained elevation raises the EWMA, zeroing out drift vs today's baseline.
+      const lagIdx = Math.max(0, i - 5);
+      const referenceBaseline = days[lagIdx].dynamicBaseline;
+      const drift = recentNightMean - referenceBaseline;
       days[i].scores.recoveryDebt = Math.min(100, Math.max(0, 30 + drift * 6));
       days[i].recoveryDebt = Math.round(days[i].scores.recoveryDebt);
     }
@@ -1007,6 +1024,20 @@ function attachRollingTrends(days) {
       const smoothed = Math.round(meanArr(window));
       days[i].scores.autonomicLoad = smoothed;
       days[i].autonomicLoad = smoothed;
+    }
+  }
+
+  const rawRecoveries = days.map(d => d.incomplete ? null : d.recoveryQuality);
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) continue;
+    const window = [];
+    for (let j = Math.max(0, i - 1); j <= Math.min(days.length - 1, i + 1); j++) {
+      if (!days[j].incomplete && rawRecoveries[j] !== null) window.push(rawRecoveries[j]);
+    }
+    if (window.length > 0) {
+      const smoothed = Math.round(meanArr(window));
+      days[i].scores.recoveryQuality = smoothed;
+      days[i].recoveryQuality = smoothed;
     }
   }
 
@@ -1269,7 +1300,7 @@ function computeDailySignals(days, baseline, maxHR) {
         hasNightData: false,
         hasDayData: false,
       };
-      const scores = { recoveryQuality: 50, autonomicLoad: 25, cardioEfficiency: 50, stressSignature: 50, recoveryDebt: 30, pulseStability: null, acwr: null };
+      const scores = { recoveryQuality: null, autonomicLoad: null, cardioEfficiency: null, stressSignature: null, recoveryDebt: null, pulseStability: null, acwr: null };
       dailySignals.push(buildDayRecord(dk, rawMetrics, scores, ["low_coverage"], coverageStats, currentRestingHR, true));
       // Still update EWMA with whatever night data exists
       const nightBpmPartial = readings.filter(r => r.hour >= NIGHT_START && r.hour <= NIGHT_END).map(r => r.bpm);
@@ -1284,7 +1315,7 @@ function computeDailySignals(days, baseline, maxHR) {
 
     const rawMetrics = computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, coverageStats);
     rawMetrics.nightHrEwmaStd = Math.round(Math.sqrt(ewmaNightVar) * 10) / 10;
-    const scores = computeScoresFromRaw(rawMetrics, baseline, readings);
+    const scores = computeScoresFromRaw(rawMetrics, baseline, readings, rawMetrics.activityLevel);
     const provisionalDay = buildDayRecord(dk, rawMetrics, scores, [], coverageStats, currentRestingHR, false);
     provisionalDay.drivers = computeDriversFromDay(provisionalDay);
     dailySignals.push(provisionalDay);
@@ -1680,14 +1711,14 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     notes.push({ icon: "✦", text: "Low stress markers. Your evenings were genuinely calm — heart rate settled well." });
   }
 
-  // ── Cardio efficiency (aware of activity days) ──
+  // ── Daytime quiescence (aware of activity days) ──
   if (avgEfficiency > 60) {
-    notes.push({ icon: "✦", text: "Good cardiovascular efficiency — a healthy proportion of your day at low heart rates." });
+    notes.push({ icon: "✦", text: "Good daytime quiescence — a healthy proportion of your day at low heart rates." });
   } else if (avgEfficiency < 35) {
     if (totalActive > valid.length * 0.4) {
-      notes.push({ icon: "—", text: `Cardiovascular efficiency is low (${Math.round(avgEfficiency)}%), but you were active on ${totalActive} of ${valid.length} days — activity naturally pushes daytime HR up. This isn't necessarily a concern.` });
+      notes.push({ icon: "—", text: `Daytime quiescence is low (${Math.round(avgEfficiency)}%), but you were active on ${totalActive} of ${valid.length} days — activity naturally pushes daytime HR up. This isn't necessarily a concern.` });
     } else {
-      notes.push({ icon: "▽", text: `Low cardiovascular efficiency (${Math.round(avgEfficiency)}%). Your heart rate ran high during the day without much recorded activity to explain it.` });
+      notes.push({ icon: "▽", text: `Low daytime quiescence (${Math.round(avgEfficiency)}%). Your heart rate ran high during the day without much recorded activity to explain it.` });
       guidance.push("A high resting daytime HR can reflect caffeine, dehydration, stress, or deconditioning. If you drink coffee past noon, try cutting it. Even a 15-minute walk at lunchtime can measurably lower average daytime HR over 2-3 weeks.");
     }
   }
@@ -1722,7 +1753,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     guidance.push("You had very few genuine rest days this month. Even one full rest day per week gives your cardiovascular system time to adapt. Without it, gains from activity get blunted.");
   }
   if (totalActive < valid.length * 0.15 && avgEfficiency < 50) {
-    guidance.push("Low activity paired with low cardiovascular efficiency suggests your system would benefit from more movement. Start small: 20-minute walks 3 times per week. Your daytime HR should start dropping within 2-3 weeks.");
+    guidance.push("Low activity paired with low daytime quiescence suggests your system would benefit from more movement. Start small: 20-minute walks 3 times per week. Your daytime HR should start dropping within 2-3 weeks.");
   }
   if (workoutDays.length > 0 && moderateDays.length === 0 && lightDays.length < 2) {
     guidance.push("Your activity pattern is all-or-nothing — hard workouts with no lighter activity in between. Adding 1-2 light days (walking, easy cycling) between workouts improves recovery and long-term cardiovascular fitness more than rest alone.");
@@ -1912,8 +1943,8 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
 
   // ── Day callouts — best and worst ──
   if (valid.length >= 7) {
-    const eligible = valid.filter(d => d.confidence !== "low");
-    const sorted = [...(eligible.length ? eligible : valid)].sort((a, b) => b.recoveryQuality - a.recoveryQuality);
+    const eligible = valid.filter(d => d.confidence !== "low" && d.recoveryQuality !== null);
+    const sorted = [...(eligible.length ? eligible : valid.filter(d => d.recoveryQuality !== null))].sort((a, b) => b.recoveryQuality - a.recoveryQuality);
     const best = sorted[0];
     const worst = sorted[sorted.length - 1];
     if (best.recoveryQuality - worst.recoveryQuality > 15) {
@@ -2231,10 +2262,11 @@ function RibbonCalendar({ valid, signals, expandedField, onExpand }) {
 
       {/* Quality legend */}
       <div style={{ display: "flex", gap: 14, marginBottom: 14, fontSize: 11, color: T.faint, alignItems: "center" }}>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.calm }} /> good</span>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.gold }} /> typical</span>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.warm }} /> attention</span>
-        <span style={{ marginLeft: "auto", letterSpacing: "0.1em" }}>{valid.length} days · thresholds from this month</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.calm }} /> better this month</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.gold }} /> mid-range</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: T.warm }} /> lower this month</span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span style={{ width: 14, height: 4, borderRadius: 1, backgroundColor: "#b0b0b0" }} /> no data</span>
+        <span style={{ marginLeft: "auto", letterSpacing: "0.1em" }}>{valid.length} days · ranked within month</span>
       </div>
 
       {/* Ribbon calendar */}
@@ -2281,8 +2313,8 @@ function RibbonCalendar({ valid, signals, expandedField, onExpand }) {
                           style={{
                             height: bandH,
                             borderRadius: 1,
-                            backgroundColor: q === null ? T.hair : qColors[q],
-                            opacity: highlighted ? (q === null ? 0.5 : 1) : 0.18,
+                            backgroundColor: q === null ? "#b0b0b0" : qColors[q],
+                            opacity: highlighted ? 1 : 0.18,
                             transition: "opacity .15s ease",
                           }} />
                       );
@@ -2319,7 +2351,8 @@ function GridHeatmap({ signals, field, label, isInverse }) {
   const valid = signals.filter(d => !d.incomplete);
   if (valid.length === 0) return null;
   const values = valid.map(d => d[field]);
-  const sorted = [...values].sort((a, b) => a - b);
+  const nonNullValues = values.filter(v => v !== null && v !== undefined);
+  const sorted = [...nonNullValues].sort((a, b) => a - b);
   let lo = sorted[Math.floor(sorted.length * 0.25)];
   let hi = sorted[Math.floor(sorted.length * 0.75)];
   if (hi - lo < 5) {
@@ -2333,7 +2366,6 @@ function GridHeatmap({ signals, field, label, isInverse }) {
   valid.forEach((d, i) => { lookup[d.date] = values[i]; });
 
   const firstDate = new Date(valid[0].date);
-  const lastDate = new Date(valid[valid.length - 1].date);
   const year = firstDate.getFullYear();
   const month = firstDate.getMonth();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
@@ -2345,10 +2377,14 @@ function GridHeatmap({ signals, field, label, isInverse }) {
     const dk = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
     if (lookup[dk] !== undefined) {
       const v = lookup[dk];
-      let quality;
-      if (isInverse) quality = v < lo ? 2 : v > hi ? 0 : 1;
-      else quality = v > hi ? 2 : v < lo ? 0 : 1;
-      cells.push({ quality, value: v, date: dk, day });
+      if (v === null || v === undefined) {
+        cells.push({ noData: true, day });
+      } else {
+        let quality;
+        if (isInverse) quality = v < lo ? 2 : v > hi ? 0 : 1;
+        else quality = v > hi ? 2 : v < lo ? 0 : 1;
+        cells.push({ quality, value: v, date: dk, day });
+      }
     } else {
       cells.push({ empty: true, day });
     }
@@ -2380,6 +2416,7 @@ function GridHeatmap({ signals, field, label, isInverse }) {
               const cell = week[di];
               if (!cell) return <div key={di} style={{ width: cellSize, height: 22, borderRadius: 2 }} />;
               if (cell.empty) return <div key={di} style={{ width: cellSize, height: 22, borderRadius: 2, backgroundColor: T.paperAlt, border: `1px dashed ${T.hair}`, boxSizing: "border-box" }} />;
+              if (cell.noData) return <div key={di} title={`${cell.day}: no data`} style={{ width: cellSize, height: 22, borderRadius: 2, backgroundColor: "#b0b0b0", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,0.7)", fontSize: 9, fontWeight: 600, letterSpacing: "0.02em", fontFamily: "'DM Sans', sans-serif" }}>{cell.day}</div>;
               return (
                 <div key={di} title={`${cell.day}: ${cell.value}`}
                   style={{ width: cellSize, height: 22, borderRadius: 2, backgroundColor: colors[cell.quality], display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,0.92)", fontSize: 9, fontWeight: 600, letterSpacing: "0.02em", fontFamily: "'DM Sans', sans-serif" }}>
@@ -2399,7 +2436,8 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
   const valid = signals.filter(d => !d.incomplete);
   if (valid.length === 0) return null;
   const values = valid.map(d => d[field]);
-  const sorted = [...values].sort((a, b) => a - b);
+  const nonNullValues = values.filter(v => v !== null && v !== undefined);
+  const sorted = [...nonNullValues].sort((a, b) => a - b);
   let lo = sorted[Math.floor(sorted.length * 0.25)];
   let hi = sorted[Math.floor(sorted.length * 0.75)];
   if (hi - lo < 5) {
@@ -2414,10 +2452,14 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
   for (let i = 0; i < startDow; i++) cells.push(null);
   for (const d of valid) {
     const v = d[field];
-    let quality;
-    if (isInverse) quality = v < lo ? 2 : v > hi ? 0 : 1;
-    else quality = v > hi ? 2 : v < lo ? 0 : 1;
-    cells.push({ quality, value: v, date: d.date });
+    if (v === null || v === undefined) {
+      cells.push({ noData: true, date: d.date });
+    } else {
+      let quality;
+      if (isInverse) quality = v < lo ? 2 : v > hi ? 0 : 1;
+      else quality = v > hi ? 2 : v < lo ? 0 : 1;
+      cells.push({ quality, value: v, date: d.date });
+    }
   }
   const weeks = [];
   for (let i = 0; i < cells.length; i += 7) {
@@ -2443,6 +2485,7 @@ function FullGridHeatmap({ signals, field, label, isInverse }) {
             {Array.from({ length: 7 }, (_, di) => {
               const cell = week[di];
               if (!cell) return <div key={di} style={{ width: 14, height: 14, borderRadius: 2, backgroundColor: T.paperAlt }} />;
+              if (cell.noData) return <div key={di} title={`${fmtDate(cell.date)}: no data`} style={{ width: 14, height: 14, borderRadius: 2, backgroundColor: "#b0b0b0", cursor: "default" }} />;
               return (
                 <div key={di} title={`${fmtDate(cell.date)}: ${cell.value}`}
                   style={{ width: 14, height: 14, borderRadius: 2, backgroundColor: colors[cell.quality], cursor: "default" }} />
@@ -2698,7 +2741,7 @@ function HRCoach() {
     { field: "recoveryQuality",   label: "Recovery Quality",        short: "Recovery",   isInverse: false },
     { field: "stressSignature",   label: "Stress Signature",        short: "Stress",     isInverse: true  },
     { field: "recoveryDebt",      label: "Recovery Debt",           short: "Debt",       isInverse: true  },
-    { field: "cardioEfficiency",  label: "Cardiovascular Efficiency", short: "Efficiency", isInverse: false },
+    { field: "cardioEfficiency",  label: "Daytime Quiescence", short: "Quiet", isInverse: false },
     { field: "autonomicLoad",     label: "Autonomic Load",          short: "Load",       isInverse: true  },
     { field: "pulseStability",    label: "Pulse Stability",         short: "Pulse",      isInverse: false },
   ];
@@ -3041,7 +3084,7 @@ function HRCoach() {
             <div style={{ fontSize: 12, color: activeTheme.faint, marginTop: -4, marginBottom: 10 }}>
               Based on HR reading variation, not inter-beat HRV. Use as a trend indicator only.
             </div>
-            <FullGridHeatmap signals={validDays} field="cardioEfficiency" label="Cardiovascular Efficiency" isInverse={false} />
+            <FullGridHeatmap signals={validDays} field="cardioEfficiency" label="Daytime Quiescence" isInverse={false} />
             <FullGridHeatmap signals={validDays} field="stressSignature" label="Stress Signature" isInverse={true} />
             <FullGridHeatmap signals={validDays} field="recoveryDebt" label="Recovery Debt" isInverse={true} />
             {validDays.some(d => d.acwr !== null) && (
@@ -3115,7 +3158,7 @@ function HRCoach() {
                 }
 
                 // Efficiency
-                if (avgEff < 40) parts.push(`Cardiovascular efficiency is on the low side (${Math.round(avgEff)}%). Your heart is working harder than it needs to during the day — hydration, caffeine timing, and regular low-intensity movement are the first things to check.`);
+                if (avgEff < 40) parts.push(`Daytime quiescence is on the low side (${Math.round(avgEff)}%). Your heart is working harder than it needs to during the day — hydration, caffeine timing, and regular low-intensity movement are the first things to check.`);
 
                 // Top recommendation
                 const overallFallback = buildFallbackPriority(overallRecovery, overallStress, avgDebt, avgEff, overallSummary.dataQuality?.copyMode || "direct");
@@ -3375,8 +3418,8 @@ function HRCoach() {
               </div>
               {valid.map((d, i) => {
                 const dayLabel = new Date(d.date).toLocaleDateString("en-GB", { weekday: "short", day: "numeric" });
-                const recColor = d.recoveryQuality > 60 ? activeTheme.calm : d.recoveryQuality < 40 ? activeTheme.warm : activeTheme.gold;
-                const stressColor = d.stressSignature > 60 ? activeTheme.warm : d.stressSignature < 35 ? activeTheme.calm : activeTheme.gold;
+                const recColor = d.recoveryQuality === null ? "#b0b0b0" : d.recoveryQuality > 60 ? activeTheme.calm : d.recoveryQuality < 40 ? activeTheme.warm : activeTheme.gold;
+                const stressColor = d.stressSignature === null ? "#b0b0b0" : d.stressSignature > 60 ? activeTheme.warm : d.stressSignature < 35 ? activeTheme.calm : activeTheme.gold;
                 const actLabel = d.activityLevel === "workout" ? "workout" : d.activityLevel === "moderate" ? "moderate" : d.activityLevel === "light" ? "light" : "";
                 const actColor = d.activityLevel === "workout" ? "#7a5aaa" : d.activityLevel === "moderate" ? "#5a7aaa" : d.activityLevel === "light" ? "#7a9a8a" : "#a09888";
                 return (
