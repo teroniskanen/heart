@@ -52,6 +52,19 @@ const NIGHT_END = 5;
 const NIGHT_LABEL = "01:00–05:59";
 const MAX_GAP_MIN = 15;
 const RAW_PERSIST_LIMIT = 5 * 1024 * 1024;
+
+// Tag thresholds — tunable constants
+const NIGHT_HR_ELEVATED_BPM = 5;         // elevated_night_hr: bpm above baseline; overridden by EWMA std when available
+const IDLE_STRESS_HRR_FRACTION = 0.30;   // high_idle_stress: fraction of HR reserve for elevation threshold
+const FLAT_EVENING_NORM = -0.001;        // flat_evening: normalized slope (bpm/min / bpm-range)
+const GOOD_EVENING_DROP_NORM = -0.004;   // good_evening_drop: normalized slope threshold
+const SHALLOW_NADIR_BPM = 8;            // shallow_nadir: UNCALIBRATED placeholder — check distribution before enabling tag
+const MID_SLEEP_AROUSAL_BPM = 10;       // mid_sleep_arousal: elevation above night mean — check sample density before enabling tag
+const COMPRESSED_RANGE_RATIO = 1.15;    // compressed_autonomic_range: day/night HR ratio — check distribution before enabling tag
+const RISING_BASELINE_BPM = 5;          // rising_baseline: 7d vs 28d night HR delta
+const MIN_NIGHT_COV_FOR_TAGS = 60;      // minimum coverageNight% for night-window tags to fire
+const MIN_MORNING_COV_FOR_TAGS = 40;    // minimum coverageMorning% for wake-window tags to fire
+const MIN_DAY_COV_FOR_TAGS = 60;        // minimum coverageDay% for daytime tags to fire
 const STORAGE_KEYS = {
   analysis: "hrc-analysis",
   raw: "hrc-raw",
@@ -445,6 +458,7 @@ function computeCoverage(readings) {
   let total = 0;
   let night = 0;
   let day = 0;
+  let morning = 0;
   for (let i = 0; i < sorted.length - 1; i++) {
     const gapMin = (sorted[i + 1].dt - sorted[i].dt) / 60000;
     if (gapMin <= 0 || gapMin > MAX_GAP_MIN) continue;
@@ -452,14 +466,17 @@ function computeCoverage(readings) {
     const h = sorted[i].hour;
     if (h >= NIGHT_START && h <= NIGHT_END) night += gapMin;
     if (h >= 8 && h <= 22) day += gapMin;
+    if (h >= 5 && h <= 9) morning += gapMin;
   }
   return {
     totalMinutes: Math.round(total),
     nightMinutes: Math.round(night),
     dayMinutes: Math.round(day),
+    morningMinutes: Math.round(morning),
     coverageTotal: Math.round(Math.min(100, (total / 1440) * 100)),
     coverageNight: Math.round(Math.min(100, (night / ((NIGHT_END - NIGHT_START + 1) * 60)) * 100)),
     coverageDay: Math.round(Math.min(100, (day / (15 * 60)) * 100)),
+    coverageMorning: Math.round(Math.min(100, (morning / (4 * 60)) * 100)),
   };
 }
 function collectWindowByMinutes(readings, startIndex, windowMinutes, fallback = 1, maxMinutes = MAX_GAP_MIN) {
@@ -555,6 +572,7 @@ function calculateTRIMP(readings, currentRestingHR, maxHR) {
 
 // Phase 4: HR Nadir Timing — finds when overnight HR reaches its lowest sustained point.
 // Healthy: nadir 2:00–3:30am. Late nadir (>5am) suggests body was fighting stress all night.
+// Returns { hour, lowestAvg } so callers can compute nadirDepth = nightMeanHR - lowestAvg.
 function computeNadirTiming(nightReadings) {
   const sorted = [...nightReadings].sort((a, b) => a.dt - b.dt);
   if (sumCoveredMinutes(sorted, 1, 5) < 45) return null;
@@ -570,14 +588,19 @@ function computeNadirTiming(nightReadings) {
       nadirHour = bucket.readings[0].hour + bucket.readings[0].minute / 60;
     }
   }
-  return nadirHour !== null ? Math.round(nadirHour * 10) / 10 : null;
+  return nadirHour !== null
+    ? { hour: Math.round(nadirHour * 10) / 10, lowestAvg: Math.round(lowestAvg * 10) / 10 }
+    : null;
 }
 
 // Phase 3: Evening Restitution Rate — linear regression slope of HR from 8pm–11pm.
 // Negative slope = HR dropping (parasympathetic recovery active). Flat/positive = nervous system stuck.
+// Returns { slope (bpm/min), startHR } so callers can normalize slope against the available HR range.
 function computeEveningDecay(readings) {
   const evening = readings.filter(r => r.hour >= 20 && r.hour <= 23).sort((a, b) => a.dt - b.dt);
   if (sumCoveredMinutes(evening, 1, 5) < 40) return null;
+
+  const startHR = evening[0].bpm;
 
   const points = evening.map((r, i) => ({
     x: (r.hour - 20) * 60 + r.minute,
@@ -594,7 +617,7 @@ function computeEveningDecay(readings) {
   const denom = sumW * sumWX2 - sumWX * sumWX;
   if (denom === 0) return null;
   const slope = (sumW * sumWXY - sumWX * sumWY) / denom;
-  return Math.round(slope * 100) / 100;
+  return { slope: Math.round(slope * 100) / 100, startHR };
 }
 
 // Wake Spike: orthostatic proxy. Compares first 30 min of waking HR to that night's mean.
@@ -629,6 +652,27 @@ function calculateWakeSpike(readings, nightMeanHR, dynamicBaseline) {
   return spike > 0 ? Math.round(spike) : null;
 }
 
+// Detects a discrete mid-sleep arousal: ≥2 consecutive readings ≥MID_SLEEP_AROUSAL_BPM above night
+// mean between 1–5am, with gaps ≤10 min. Requires ≥2 consecutive samples to filter single noisy points.
+// Returns boolean (null when night data is absent). Tag is held pending sample-density validation.
+function computeMidSleepArousal(nightReadings, nightMeanHR) {
+  if (nightMeanHR === null) return null;
+  const sorted = nightReadings.filter(r => r.hour >= 1 && r.hour <= 5).sort((a, b) => a.dt - b.dt);
+  if (sorted.length < 2) return false;
+  const threshold = nightMeanHR + MID_SLEEP_AROUSAL_BPM;
+  let streak = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const gapMin = i > 0 ? (sorted[i].dt - sorted[i - 1].dt) / 60000 : 0;
+    if (sorted[i].bpm > threshold && (i === 0 || gapMin <= 10)) {
+      streak++;
+      if (streak >= 2) return true;
+    } else {
+      streak = 0;
+    }
+  }
+  return false;
+}
+
 function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, coverageStats) {
   const coverage = coverageStats.coverageTotal;
   const nightCoverage = coverageStats.coverageNight;
@@ -649,8 +693,18 @@ function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, cover
   const dayMinHR = Math.min(...allBpm);
 
   const activity = calculateTRIMP(readings, currentRestingHR, maxHR);
-  const nadirHour = computeNadirTiming(nightReadings);
-  const eveningDecay = computeEveningDecay(readings);
+  const nadirResult = computeNadirTiming(nightReadings);
+  const nadirHour = nadirResult?.hour ?? null;
+  const nadirDepth = (nadirResult && nightMeanHR !== null)
+    ? Math.round((nightMeanHR - nadirResult.lowestAvg) * 10) / 10
+    : null;
+  const eveningResult = computeEveningDecay(readings);
+  const eveningDecay = eveningResult?.slope ?? null;
+  const eveningStartHR = eveningResult?.startHR ?? null;
+  const eveningRange = (eveningStartHR !== null && nightMeanHR !== null) ? eveningStartHR - nightMeanHR : null;
+  const eveningDecayNorm = (eveningDecay !== null && eveningRange !== null && eveningRange > 5)
+    ? Math.round((eveningDecay / eveningRange) * 10000) / 10000
+    : null;
 
   let pulseStability = null;
   let nightVolatilityPercent = null;
@@ -679,8 +733,8 @@ function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, cover
 
   let idleStressMinutes = null;
   if (hasDayData && (activity.level === "rest" || activity.level === "light")) {
-    const idleReadings = readings.filter(r => r.hour >= 8 && r.hour <= 20).sort((a, b) => a.dt - b.dt);
-    const elevThreshold = currentRestingHR + 25;
+    const idleReadings = readings.filter(r => r.hour >= 7 && r.hour <= 21).sort((a, b) => a.dt - b.dt);
+    const elevThreshold = currentRestingHR + IDLE_STRESS_HRR_FRACTION * Math.max(1, maxHR - currentRestingHR);
     let stressMinutes = 0;
     let streakMinutes = 0;
     for (let i = 0; i < idleReadings.length; i++) {
@@ -696,6 +750,11 @@ function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, cover
     idleStressMinutes = Math.round(stressMinutes);
   }
 
+  const midSleepArousal = hasNightData ? computeMidSleepArousal(nightReadings, nightMeanHR) : null;
+  const autonomicRangeRatio = (nightMeanHR !== null && nightMeanHR > 0)
+    ? Math.round((Math.round(dayMeanHR) / Math.round(nightMeanHR)) * 100) / 100
+    : null;
+
   return {
     dayMeanHR: Math.round(dayMeanHR),
     dayMinHR,
@@ -709,17 +768,22 @@ function computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, cover
     coverageTotal: coverage,
     coverageNight: nightCoverage,
     coverageDay: dayCoverage,
+    coverageMorning: coverageStats.coverageMorning ?? null,
     readingCount: readings.length,
     activeMinutes: activity.activeMinutes,
     peakHR: activity.peakHR,
     trimp: activity.trimp,
     activityLevel: activity.level,
     nadirHour,
+    nadirDepth,
     eveningDecay,
+    eveningDecayNorm,
     pulseStability,
     nightVolatilityPercent,
     wakeSpike,
     idleStressMinutes,
+    midSleepArousal,
+    autonomicRangeRatio,
     hasNightData,
     hasDayData,
   };
@@ -772,20 +836,65 @@ function computeScoresFromRaw(rawMetrics, baseline, readings) {
 function computeDriversFromDay(day) {
   const raw = day.rawMetrics || {};
   const drivers = [];
+
+  const nightOk   = (raw.coverageNight   ?? 0) >= MIN_NIGHT_COV_FOR_TAGS;
+  const morningOk = (raw.coverageMorning ?? 0) >= MIN_MORNING_COV_FOR_TAGS;
+  const dayOk     = (raw.coverageDay     ?? 0) >= MIN_DAY_COV_FOR_TAGS;
+
   if ((raw.coverageTotal ?? 0) < 80) drivers.push("low_coverage");
-  if (raw.nightMeanHR !== null && raw.nightMeanHR > raw.dynamicBaseline + 3) drivers.push("elevated_night_hr");
-  if (raw.nadirHour !== null && raw.nadirHour > 5) drivers.push("late_nadir");
-  if (raw.eveningDecay !== null && raw.eveningDecay > -0.02) drivers.push("flat_evening");
-  if (day.pulseStability !== null && day.pulseStability < 50) drivers.push("low_pulse_stability");
-  if (raw.nightVolatilityPercent !== null && raw.nightVolatilityPercent > 8) drivers.push("high_night_volatility");
-  if (raw.wakeSpike !== null && raw.wakeSpike > 30) drivers.push("high_wake_spike");
-  if (raw.idleStressMinutes !== null && raw.idleStressMinutes > 45) drivers.push("high_idle_stress");
+
+  // Night-window tags
+  if (nightOk) {
+    const elevatedThreshold = raw.nightHrEwmaStd
+      ? Math.max(NIGHT_HR_ELEVATED_BPM, raw.nightHrEwmaStd * 1.5)
+      : NIGHT_HR_ELEVATED_BPM;
+    if (raw.nightMeanHR !== null && raw.nightMeanHR > raw.dynamicBaseline + elevatedThreshold)
+      drivers.push("elevated_night_hr");
+    if (raw.nadirHour !== null && raw.nadirHour > 5) drivers.push("late_nadir");
+    // shallow_nadir tag held — metric stored as nadirDepth, calibrate SHALLOW_NADIR_BPM before enabling:
+    // if (raw.nadirDepth !== null && raw.nadirDepth < SHALLOW_NADIR_BPM) drivers.push("shallow_nadir");
+    if (raw.nightVolatilityPercent !== null && raw.nightVolatilityPercent > 8) drivers.push("high_night_volatility");
+    if (day.pulseStability !== null && day.pulseStability < 50) drivers.push("low_pulse_stability");
+    if (raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5) drivers.push("good_nadir");
+    if (day.pulseStability !== null && day.pulseStability >= 70) drivers.push("stable_pulse");
+    // mid_sleep_arousal tag held — metric stored, validate sample density before enabling:
+    // if (raw.midSleepArousal === true) drivers.push("mid_sleep_arousal");
+  }
+
+  // Morning/wake-window tags
+  if (morningOk) {
+    if (raw.wakeSpike !== null && raw.wakeSpike > 30) drivers.push("high_wake_spike");
+    if (raw.wakeSpike !== null && raw.wakeSpike <= 25) drivers.push("smooth_wake");
+  }
+
+  // Evening tags (use normalized slope when available, fall back to raw)
+  if (raw.eveningDecayNorm !== null) {
+    if (raw.eveningDecayNorm > FLAT_EVENING_NORM) drivers.push("flat_evening");
+    if (raw.eveningDecayNorm < GOOD_EVENING_DROP_NORM) drivers.push("good_evening_drop");
+  } else if (raw.eveningDecay !== null && dayOk) {
+    if (raw.eveningDecay > -0.02) drivers.push("flat_evening");
+    if (raw.eveningDecay < -0.10) drivers.push("good_evening_drop");
+  }
+
+  // Daytime tags
+  if (dayOk) {
+    if (raw.idleStressMinutes !== null && raw.idleStressMinutes > 45) drivers.push("high_idle_stress");
+    if (raw.idleStressMinutes !== null && raw.idleStressMinutes <= 10) drivers.push("calm_day");
+  }
+
+  // compressed_autonomic_range tag held — metric stored as autonomicRangeRatio, check distribution first:
+  // if (nightOk && dayOk && raw.autonomicRangeRatio !== null && raw.autonomicRangeRatio < COMPRESSED_RANGE_RATIO)
+  //   drivers.push("compressed_autonomic_range");
+
+  // Compound positive tag: all three night conditions must be well-covered
+  if (nightOk && morningOk &&
+      raw.nightMeanHR !== null && raw.nightMeanHR <= raw.dynamicBaseline - 2 &&
+      raw.wakeSpike !== null && raw.wakeSpike <= 25 &&
+      raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5)
+    drivers.push("good_recovery_morning");
+
   if (raw.activityLevel === "workout" || raw.activityLevel === "moderate") drivers.push("hard_training_day");
-  if (raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5) drivers.push("good_nadir");
-  if (raw.eveningDecay !== null && raw.eveningDecay < -0.10) drivers.push("good_evening_drop");
-  if (day.pulseStability !== null && day.pulseStability >= 70) drivers.push("stable_pulse");
-  if (raw.wakeSpike !== null && raw.wakeSpike <= 25) drivers.push("smooth_wake");
-  if (raw.idleStressMinutes !== null && raw.idleStressMinutes <= 10) drivers.push("calm_day");
+
   return drivers;
 }
 
@@ -803,6 +912,7 @@ function buildDayRecord(date, rawMetrics, scores, drivers, coverageStats, curren
     coverageTotal: rawMetrics.coverageTotal,
     coverageNight: rawMetrics.coverageNight,
     coverageDay: rawMetrics.coverageDay,
+    coverageMorning: rawMetrics.coverageMorning ?? null,
     dynamicBaseline: rawMetrics.dynamicBaseline ?? Math.round(currentRestingHR * 10) / 10,
     recoveryQuality: scores.recoveryQuality,
     autonomicLoad: scores.autonomicLoad,
@@ -821,10 +931,15 @@ function buildDayRecord(date, rawMetrics, scores, drivers, coverageStats, curren
     trimp: rawMetrics.trimp ?? 0,
     hasWorkout: rawMetrics.activityLevel === "workout",
     nadirHour: rawMetrics.nadirHour ?? null,
+    nadirDepth: rawMetrics.nadirDepth ?? null,
     eveningDecay: rawMetrics.eveningDecay ?? null,
+    eveningDecayNorm: rawMetrics.eveningDecayNorm ?? null,
     nightVolatilityPercent: rawMetrics.nightVolatilityPercent ?? null,
     wakeSpike: rawMetrics.wakeSpike ?? null,
     idleStressMinutes: rawMetrics.idleStressMinutes ?? null,
+    midSleepArousal: rawMetrics.midSleepArousal ?? null,
+    autonomicRangeRatio: rawMetrics.autonomicRangeRatio ?? null,
+    nightHrEwmaStd: rawMetrics.nightHrEwmaStd ?? null,
     drivers,
   };
 }
@@ -835,12 +950,38 @@ function attachRollingTrends(days) {
     days[i].trends = {
       nightHr7d: rollingWeightedMean(days, i, "nightMeanHR", 7),
       nightHr14d: rollingWeightedMean(days, i, "nightMeanHR", 14),
+      nightHr28d: rollingWeightedMean(days, i, "nightMeanHR", 28),
       recovery7d: rollingWeightedMean(days, i, "recoveryQuality", 7),
       recovery14d: rollingWeightedMean(days, i, "recoveryQuality", 14),
       stress7d: rollingWeightedMean(days, i, "stressSignature", 7),
       stress14d: rollingWeightedMean(days, i, "stressSignature", 14),
       coverageNight7d: rollingMean(days, i, "coverageNight", 7, d => !d.incomplete && d.coverageNight !== null && d.coverageNight !== undefined),
     };
+  }
+
+  // Cross-day tags: belong in the trends layer, not the stateless daily driver pass.
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].incomplete) continue;
+    const t = days[i].trends;
+
+    // rising_baseline: 7-day night HR has climbed >RISING_BASELINE_BPM above 28-day baseline.
+    // Requires enough history for both windows to be meaningful.
+    if (t.nightHr7d !== null && t.nightHr28d !== null &&
+        t.nightHr7d > t.nightHr28d + RISING_BASELINE_BPM) {
+      if (!days[i].drivers.includes("rising_baseline"))
+        days[i].drivers.push("rising_baseline");
+    }
+
+    // incomplete_workout_recovery: the night after a hard day is still elevated.
+    if (i > 0 && !days[i - 1].incomplete) {
+      const prevLevel = days[i - 1].activityLevel;
+      if ((prevLevel === "workout" || prevLevel === "moderate") &&
+          days[i].nightMeanHR !== null &&
+          days[i].nightMeanHR > days[i].dynamicBaseline + NIGHT_HR_ELEVATED_BPM) {
+        if (!days[i].drivers.includes("incomplete_workout_recovery"))
+          days[i].drivers.push("incomplete_workout_recovery");
+      }
+    }
   }
 
   for (let i = 0; i < days.length; i++) {
@@ -975,7 +1116,10 @@ function generateDayRecommendations(day, prevDay, context = {}) {
       ["lighter_late_evening", "alcohol_free_winddown"]
     ));
   }
-  if (day.eveningDecay !== null && day.eveningDecay > -0.02) {
+  const flatEvening = day.eveningDecayNorm !== null
+    ? day.eveningDecayNorm > FLAT_EVENING_NORM
+    : (day.eveningDecay !== null && day.eveningDecay > -0.02);
+  if (flatEvening) {
     recs.push(buildRecommendation(
       "flat_evening_pattern",
       "moderate",
@@ -1082,7 +1226,9 @@ function computeDailySignals(days, baseline, maxHR) {
   // Phase 2: EWMA dynamic baseline — starts from initial 14-day baseline,
   // updates each night so signals adapt as fitness changes.
   const alpha = 2 / (21 + 1); // 21-day smoothing factor
+  const varAlpha = 2 / (14 + 1); // 14-day EWMA for inter-night variance
   let currentRestingHR = baseline.restingHR;
+  let ewmaNightVar = 4; // initial variance (≈2 bpm std); updated each night
 
   for (const dk of dateKeys) {
     const readings = days[dk];
@@ -1103,17 +1249,23 @@ function computeDailySignals(days, baseline, maxHR) {
         coverageTotal: coverageStats.coverageTotal,
         coverageNight: coverageStats.coverageNight,
         coverageDay: coverageStats.coverageDay,
+        coverageMorning: coverageStats.coverageMorning ?? null,
         readingCount: readings.length,
         activeMinutes: 0,
         peakHR: 0,
         trimp: 0,
         activityLevel: "rest",
         nadirHour: null,
+        nadirDepth: null,
         eveningDecay: null,
+        eveningDecayNorm: null,
         pulseStability: null,
         nightVolatilityPercent: null,
         wakeSpike: null,
         idleStressMinutes: null,
+        midSleepArousal: null,
+        autonomicRangeRatio: null,
+        nightHrEwmaStd: null,
         hasNightData: false,
         hasDayData: false,
       };
@@ -1122,20 +1274,25 @@ function computeDailySignals(days, baseline, maxHR) {
       // Still update EWMA with whatever night data exists
       const nightBpmPartial = readings.filter(r => r.hour >= NIGHT_START && r.hour <= NIGHT_END).map(r => r.bpm);
       if (nightBpmPartial.length >= 5) {
-        currentRestingHR = meanArr(nightBpmPartial) * alpha + currentRestingHR * (1 - alpha);
+        const partialNightMean = meanArr(nightBpmPartial);
+        const residual = partialNightMean - currentRestingHR;
+        ewmaNightVar = varAlpha * (residual * residual) + (1 - varAlpha) * ewmaNightVar;
+        currentRestingHR = partialNightMean * alpha + currentRestingHR * (1 - alpha);
       }
       continue;
     }
 
     const rawMetrics = computeDailyTimeline(readings, currentRestingHR, baseline, maxHR, coverageStats);
+    rawMetrics.nightHrEwmaStd = Math.round(Math.sqrt(ewmaNightVar) * 10) / 10;
     const scores = computeScoresFromRaw(rawMetrics, baseline, readings);
     const provisionalDay = buildDayRecord(dk, rawMetrics, scores, [], coverageStats, currentRestingHR, false);
     provisionalDay.drivers = computeDriversFromDay(provisionalDay);
     dailySignals.push(provisionalDay);
 
-    // Update EWMA after this day's signals are computed
-    // (today's signals compare against yesterday's baseline)
+    // Update EWMA after this day's signals are computed so today compares against prior baseline.
     if (rawMetrics.hasNightData) {
+      const residual = rawMetrics.nightMeanHR - currentRestingHR;
+      ewmaNightVar = varAlpha * (residual * residual) + (1 - varAlpha) * ewmaNightVar;
       currentRestingHR = rawMetrics.nightMeanHR * alpha + currentRestingHR * (1 - alpha);
     }
   }
@@ -1668,8 +1825,8 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     for (const k of d.drivers) driverCounts[k] = (driverCounts[k] || 0) + 1;
   }
 
-  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_pulse_stability"];
-  const winKeys = ["good_nadir", "good_evening_drop", "stable_pulse", "smooth_wake", "calm_day"];
+  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_pulse_stability", "rising_baseline", "incomplete_workout_recovery"];
+  const winKeys = ["good_nadir", "good_evening_drop", "stable_pulse", "smooth_wake", "calm_day", "good_recovery_morning"];
 
   const labelMap = {
     elevated_night_hr: "elevated overnight HR",
@@ -1679,11 +1836,14 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     low_pulse_stability: "low pulse stability",
     high_wake_spike: "high wake-up spike",
     high_idle_stress: "high daytime idle stress",
+    rising_baseline: "rising resting HR trend",
+    incomplete_workout_recovery: "incomplete post-workout recovery",
     good_nadir: "optimal nadir timing",
     good_evening_drop: "strong evening wind-down",
     stable_pulse: "stable overnight rhythm",
     smooth_wake: "smooth wake response",
     calm_day: "calm daytime HR",
+    good_recovery_morning: "restorative night",
   };
 
   const topDisruptors = disruptorKeys
@@ -1783,7 +1943,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
         // Driver deltas
         const prevCounts = {};
         for (const d of prevValid) { if (d.drivers) for (const k of d.drivers) prevCounts[k] = (prevCounts[k] || 0) + 1; }
-        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_pulse_stability","good_nadir","good_evening_drop","stable_pulse","smooth_wake","calm_day"];
+        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_pulse_stability","rising_baseline","incomplete_workout_recovery","good_nadir","good_evening_drop","stable_pulse","smooth_wake","calm_day","good_recovery_morning"];
         const driverDeltas = allDriverKeys
           .map(k => ({ k, curr: driverCounts[k] || 0, prev: prevCounts[k] || 0, delta: (driverCounts[k] || 0) - (prevCounts[k] || 0) }))
           .filter(x => Math.abs(x.delta) >= 2)
@@ -1838,13 +1998,15 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     const tough = scored.reduce((a, b) => b.score < a.score ? b : a);
     // Pick forward focus from dominant monthly disruptors
     const focusMap = [
-      { key: "late_nadir",          rec: "Earlier evenings and lighter meals after 8 pm" },
-      { key: "high_idle_stress",    rec: "Reduce stimulants after noon and add brief midday movement" },
-      { key: "high_wake_spike",     rec: "Hydrate immediately on waking and review pre-sleep habits" },
-      { key: "elevated_night_hr",   rec: "Prioritise sleep regularity over duration this week" },
-      { key: "flat_evening",        rec: "Wind down earlier — dimmer light and no screens after 9 pm" },
-      { key: "high_night_volatility", rec: "Eliminate alcohol and heavy meals in the 3 hours before bed" },
-      { key: "low_pulse_stability",   rec: "Space intensity and add one genuine rest day" },
+      { key: "late_nadir",                    rec: "Earlier evenings and lighter meals after 8 pm" },
+      { key: "high_idle_stress",              rec: "Reduce stimulants after noon and add brief midday movement" },
+      { key: "high_wake_spike",              rec: "Hydrate immediately on waking and review pre-sleep habits" },
+      { key: "elevated_night_hr",            rec: "Prioritise sleep regularity over duration this week" },
+      { key: "flat_evening",                 rec: "Wind down earlier — dimmer light and no screens after 9 pm" },
+      { key: "high_night_volatility",        rec: "Eliminate alcohol and heavy meals in the 3 hours before bed" },
+      { key: "low_pulse_stability",          rec: "Space intensity and add one genuine rest day" },
+      { key: "rising_baseline",              rec: "Take stock of cumulative load — add recovery days before adding more training" },
+      { key: "incomplete_workout_recovery",  rec: "Allow an extra easy day before your next hard session" },
     ];
     let focusRec = null;
     let focusReason = null;
@@ -3229,11 +3391,14 @@ function HRCoach() {
         const drv = d.drivers || [];
         if (drv.includes("late_nadir")) driverTags.push("🌙 late nadir");
         if (drv.includes("elevated_night_hr")) driverTags.push("↑ night HR");
+        if (drv.includes("rising_baseline")) driverTags.push("↑↑ baseline");
         if (drv.includes("high_wake_spike")) driverTags.push("⚡ wake spike");
         if (drv.includes("high_idle_stress")) driverTags.push("🔥 idle stress");
         if (drv.includes("flat_evening")) driverTags.push("↔ evening");
-        if (drv.includes("high_night_volatility") || drv.includes("low_pulse_stability")) driverTags.push("~ Pulse");
-        if (drv.includes("good_nadir")) driverTags.push("✦ good nadir");
+        if (drv.includes("high_night_volatility") || drv.includes("low_pulse_stability")) driverTags.push("~ pulse");
+        if (drv.includes("incomplete_workout_recovery")) driverTags.push("⏳ slow recovery");
+        if (drv.includes("good_recovery_morning")) driverTags.push("✦ full recovery");
+        if (drv.includes("good_nadir")) driverTags.push("✦ nadir");
         const base = [actLabel, d.activeMinutes > 0 && actLabel && `${d.activeMinutes}m`, d.trimp > 0 && `TRIMP ${d.trimp}`, d.acwr !== null && (d.acwr > 1.5 ? `⚠ ACWR ${d.acwr}` : d.acwr < 0.8 ? `↓ ACWR ${d.acwr}` : null), d.coverage < 80 && `${d.coverage}%`, d.coverageNight < 50 && `${d.coverageNight}% night`, d.confidence !== "high" && `⚠ ${confidenceLabel(d.confidence)}`, ...driverTags];
         return base.filter(Boolean).join(" · ");
       })()}
