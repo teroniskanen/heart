@@ -886,8 +886,7 @@ function computeDriversFromDay(day, thresholds = null) {
     if (raw.nadirHour !== null && raw.nadirHour >= 2 && raw.nadirHour <= 3.5) drivers.push("good_nadir");
     const stablePulseThr = thresholds ? (thresholds.lowPulseStabThreshold + 15) : 70;
     if (day.pulseStability !== null && day.pulseStability >= stablePulseThr) drivers.push("stable_pulse");
-    // mid_sleep_arousal tag held — metric stored, validate sample density before enabling:
-    // if (raw.midSleepArousal === true) drivers.push("mid_sleep_arousal");
+    if (raw.midSleepArousal === true) drivers.push("mid_sleep_arousal");
   }
 
   // Morning/wake-window tags
@@ -1922,7 +1921,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     for (const k of d.drivers) driverCounts[k] = (driverCounts[k] || 0) + 1;
   }
 
-  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_pulse_stability", "rising_baseline", "incomplete_workout_recovery"];
+  const disruptorKeys = ["elevated_night_hr", "late_nadir", "flat_evening", "high_night_volatility", "high_wake_spike", "high_idle_stress", "low_pulse_stability", "mid_sleep_arousal", "rising_baseline", "incomplete_workout_recovery"];
   const winKeys = ["good_nadir", "good_evening_drop", "stable_pulse", "smooth_wake", "calm_day", "good_recovery_morning"];
 
   const labelMap = {
@@ -1933,6 +1932,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
     low_pulse_stability: "low pulse stability",
     high_wake_spike: "high wake-up spike",
     high_idle_stress: "high daytime idle stress",
+    mid_sleep_arousal: "mid-sleep HR arousal",
     rising_baseline: "rising resting HR trend",
     incomplete_workout_recovery: "incomplete post-workout recovery",
     good_nadir: "optimal nadir timing",
@@ -2040,7 +2040,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
         // Driver deltas
         const prevCounts = {};
         for (const d of prevValid) { if (d.drivers) for (const k of d.drivers) prevCounts[k] = (prevCounts[k] || 0) + 1; }
-        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_pulse_stability","rising_baseline","incomplete_workout_recovery","good_nadir","good_evening_drop","stable_pulse","smooth_wake","calm_day","good_recovery_morning"];
+        const allDriverKeys = ["elevated_night_hr","late_nadir","flat_evening","high_night_volatility","high_wake_spike","high_idle_stress","low_pulse_stability","mid_sleep_arousal","rising_baseline","incomplete_workout_recovery","good_nadir","good_evening_drop","stable_pulse","smooth_wake","calm_day","good_recovery_morning"];
         const driverDeltas = allDriverKeys
           .map(k => ({ k, curr: driverCounts[k] || 0, prev: prevCounts[k] || 0, delta: (driverCounts[k] || 0) - (prevCounts[k] || 0) }))
           .filter(x => Math.abs(x.delta) >= 2)
@@ -2102,6 +2102,7 @@ function generateMonthCoachNotes(monthSignals, baseline, allSignals, allMonthRep
       { key: "flat_evening",                 rec: "Wind down earlier — dimmer light and no screens after 9 pm" },
       { key: "high_night_volatility",        rec: "Eliminate alcohol and heavy meals in the 3 hours before bed" },
       { key: "low_pulse_stability",          rec: "Space intensity and add one genuine rest day" },
+      { key: "mid_sleep_arousal",            rec: "Avoid alcohol, large meals, and stimulants in the 3 hours before bed" },
       { key: "rising_baseline",              rec: "Take stock of cumulative load — add recovery days before adding more training" },
       { key: "incomplete_workout_recovery",  rec: "Allow an extra easy day before your next hard session" },
     ];
@@ -3296,6 +3297,7 @@ function HRCoach() {
               low_pulse_stability: "Low pulse stability",
               high_wake_spike: "High wake-up spike",
               high_idle_stress: "High idle stress",
+              mid_sleep_arousal: "Mid-sleep HR arousal",
               good_nadir: "Optimal nadir timing",
               good_evening_drop: "Strong evening wind-down",
               stable_pulse: "Stable overnight rhythm",
